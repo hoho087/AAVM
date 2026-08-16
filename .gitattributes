@@ -1,0 +1,22 @@
+# Keep source files portable across Linux and Windows contributors.
+* text=auto
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Patches may intentionally contain whitespace needed by their context.
+*.patch -text
+*.mypatch -text
+
+# Never ask Git to diff binary assets.
+*.bmp binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.so binary
+*.exe binary
+*.rar binary
+*.iso binary
+*.qcow2 binary

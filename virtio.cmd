@@ -1,0 +1,42 @@
+@echo off
+cd "%~dp0"
+
+if "%1"=="" (
+  powershell Start-Process '%~nx0' -ArgumentList 'ELEVATE' -Verb runas
+  exit
+)
+
+for /F "usebackq" %%a in (`PowerShell ^(Get-Date^).ToString^('dd'^)`) do set DAY=%%a
+for /F "usebackq" %%a in (`PowerShell ^(Get-Date^).ToString^('MM'^)`) do set MONTH=%%a
+set /A DAY=100%DAY% %% 100
+set /A MONTH=100%MONTH% %% 100
+set /A DEV=49152 + (%DAY% + %MONTH%) * 100 + %DAY% * %MONTH%
+echo %DEV%
+cmd /C exit %DEV%
+set DEV=%=EXITCODE:~-4%
+echo %DEV%
+
+setlocal ENABLEEXTENSIONS ENABLEDELAYEDEXPANSION
+echo.
+echo  Install: custom 'NetKVM' folder from (C-Z)
+for %%A in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+  echo|set /P ="%%A "
+  if exist "%%A:\NetKVM\." (
+    echo.
+    copy /Y "%%A:\NetKVM\w10\amd64\netkvm.*" "%DEV%.*"
+    copy /Y "%%A:\NetKVM\w10\amd64\netkvmp.exe" "%DEV%.exe"
+    goto :_EXIT
+  )
+)
+:_EXIT
+echo.
+endlocal
+
+powershell -Command "(Get-Content %DEV%.inf).Replace('1AF4&DEV_1000&SUBSYS_00011AF4&REV_00, PCI\VEN_1AF4&DEV_1000', '8086&DEV_%DEV%&SUBSYS_00018086&REV_00, PCI\VEN_8086&DEV_%DEV%').Replace('kvmnet6', '%DEV%').Replace('netkvmp', '%DEV%') | Out-File -encoding Ascii %DEV%.txt"
+fc %DEV%.inf %DEV%.txt
+powershell -Command "(Get-Content %DEV%.txt).Replace('netkvm', '%DEV%').Replace('NetKVM', 'Intel').Replace('Red Hat, Inc.', 'Intel').Replace('Red Hat VirtIO', 'Intel(R)') | Out-File -encoding Ascii %DEV%.inf"
+fc %DEV%.txt %DEV%.inf
+
+echo bcdedit /set testsigning on
+bcdedit /set testsigning on
+pause

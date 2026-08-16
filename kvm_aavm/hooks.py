@@ -1,0 +1,527 @@
+from __future__ import annotations
+
+import re
+import shlex
+from pathlib import Path
+
+from .hardware import PciDevice
+from .util import AppError, Runner, atomic_write, require_root, valid_vm_name
+
+
+HOOK_ROOT = Path("/etc/libvirt/hooks/kvm-aavm")
+LEGACY_HOOK_ROOT = Path("/etc/libvirt/hooks/qemu.d")
+PROC_ROOT = Path("/proc")
+PCI_DEVICES_ROOT = Path("/sys/bus/pci/devices")
+PCI_DRIVERS_PROBE = Path("/sys/bus/pci/drivers_probe")
+VTCON_ROOT = Path("/sys/class/vtconsole")
+EFI_FRAMEBUFFER_BIND = Path("/sys/bus/platform/drivers/efi-framebuffer/bind")
+SYS_MODULE_ROOT = Path("/sys/module")
+
+
+def _write_hook(path: Path, body: str) -> None:
+    atomic_write(path, "#!/usr/bin/env bash\nset -euo pipefail\n" + body.strip() + "\n", 0o755)
+
+
+def _remove_legacy(paths: list[Path]) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
+        parent = path.parent
+        while parent != LEGACY_HOOK_ROOT:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+
+def _driver_module(device: PciDevice) -> str | None:
+    """Return the original host driver when one is known.
+
+    Unbound devices and devices already bound to vfio-pci are valid passthrough
+    candidates. In those cases there is no host driver to restore later, so
+    return None instead of aborting VM creation.
+    """
+    module = device.driver or ""
+    if module in {"", "driver", "vfio-pci"}:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", module):
+        raise AppError(f"Invalid host driver name for PCI {device.address}: {module!r}.")
+    return module
+
+
+def _gpu_unload_modules(devices: list[PciDevice]) -> list[str]:
+    modules: list[str] = []
+    for device in devices:
+        module = _driver_module(device)
+        if module is None or module == "snd_hda_intel":
+            continue
+        expanded = ["nvidia_drm", "nvidia_modeset", "nvidia_uvm", "nvidia"] if module == "nvidia" else [module]
+        for item in expanded:
+            if item not in modules:
+                modules.append(item)
+    return modules
+
+
+def _qemu_running(vm_name: str) -> bool:
+    needle = f"guest={vm_name},".encode()
+    for cmdline in PROC_ROOT.glob("[0-9]*/cmdline"):
+        try:
+            value = cmdline.read_bytes()
+        except OSError:
+            continue
+        if b"qemu-system" in value and needle in value:
+            return True
+    return False
+
+
+def _bound_driver(device_path: Path) -> str | None:
+    try:
+        return (device_path / "driver").resolve(strict=True).name
+    except OSError:
+        return None
+
+
+def _restore_device(device: PciDevice, runner: Runner) -> str:
+    address = f"0000:{device.address}"
+    device_path = PCI_DEVICES_ROOT / address
+    if not device_path.is_dir():
+        raise AppError(f"PCI device disappeared: {address}")
+    expected = _driver_module(device)
+    current = _bound_driver(device_path)
+
+    # If there was no original host driver, restore the device to an unbound
+    # state instead of guessing a driver such as nouveau/nvidia.
+    if expected is None:
+        if current:
+            try:
+                (device_path / "driver" / "unbind").write_text(address, encoding="utf-8")
+            except OSError as exc:
+                raise AppError(f"Cannot unbind {address} from {current}: {exc}") from exc
+        override = device_path / "driver_override"
+        if override.exists():
+            try:
+                override.write_text("\n", encoding="utf-8")
+            except OSError as exc:
+                raise AppError(f"Cannot clear driver_override for {address}: {exc}") from exc
+        return ""
+
+    if current and current != expected:
+        try:
+            (device_path / "driver" / "unbind").write_text(address, encoding="utf-8")
+        except OSError as exc:
+            raise AppError(f"Cannot unbind {address} from {current}: {exc}") from exc
+    override = device_path / "driver_override"
+    if override.exists():
+        try:
+            override.write_text("\n", encoding="utf-8")
+        except OSError as exc:
+            raise AppError(f"Cannot clear driver_override for {address}: {exc}") from exc
+    runner.run(["modprobe", expected], check=False)
+    if _bound_driver(device_path) != expected:
+        try:
+            PCI_DRIVERS_PROBE.write_text(address, encoding="utf-8")
+        except OSError as exc:
+            raise AppError(f"Cannot reprobe {address}: {exc}") from exc
+    actual = _bound_driver(device_path)
+    if actual != expected:
+        raise AppError(f"PCI {address} expected driver {expected}, but is bound to {actual or 'none'}.")
+    return expected
+
+
+def _write_optional(path: Path, value: str) -> None:
+    try:
+        if path.exists():
+            path.write_text(value, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_driver_override(device: PciDevice) -> None:
+    override = PCI_DEVICES_ROOT / f"0000:{device.address}" / "driver_override"
+    if override.exists():
+        try:
+            override.write_text("\n", encoding="utf-8")
+        except OSError as exc:
+            raise AppError(f"Cannot clear driver_override for PCI {device.address}: {exc}") from exc
+
+
+def _reactivate_graphical_seat(runner: Runner) -> None:
+    """Best-effort VT/connector refresh after a single GPU returns to the host."""
+    script = r"""
+session=""
+for attempt in {1..30}; do
+  session="$(loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null || true)"
+  [[ -n "$session" ]] && break
+  sleep 0.25
+done
+[[ -n "$session" ]] || exit 0
+tty="$(loginctl show-session "$session" -p TTY --value 2>/dev/null || true)"
+if [[ "$tty" =~ ^tty([0-9]+)$ ]]; then
+  chvt "${BASH_REMATCH[1]}" || true
+fi
+command -v xrandr >/dev/null 2>&1 || exit 0
+command -v runuser >/dev/null 2>&1 || exit 0
+uid="$(loginctl show-session "$session" -p User --value 2>/dev/null || true)"
+user="$(loginctl show-session "$session" -p Name --value 2>/dev/null || true)"
+[[ "$uid" =~ ^[0-9]+$ && -n "$user" ]] || exit 0
+auth="/run/user/$uid/gdm/Xauthority"
+xr=(runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xrandr)
+outputs=()
+for attempt in {1..40}; do
+  if [[ ! -r "$auth" ]]; then
+    auth="$(getent passwd "$uid" | cut -d: -f6)/.Xauthority"
+    xr=(runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xrandr)
+  fi
+  mapfile -t outputs < <("${xr[@]}" --query 2>/dev/null | awk '$2 == "connected" {print $1}')
+  ((${#outputs[@]})) && break
+  sleep 0.25
+done
+((${#outputs[@]})) || exit 0
+# Mutter can reapply the saved high-refresh mode shortly after GDM starts.
+# Wait until that initialization settles, then select each monitor's EDID
+# preferred mode as a hardware-neutral recovery baseline.
+sleep 3
+for output in "${outputs[@]}"; do
+  "${xr[@]}" --output "$output" --off || true
+done
+sleep 1
+for output in "${outputs[@]}"; do
+  "${xr[@]}" --output "$output" --preferred || true
+done
+runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xset dpms force on 2>/dev/null || true
+"""
+    runner.run(["bash", "-lc", script], check=False)
+
+
+def recover_single_gpu(vm_name: str, devices: list[PciDevice], runner: Runner) -> None:
+    """Reclaim a single passthrough GPU after a failed VM start."""
+    require_root()
+    name = valid_vm_name(vm_name)
+    if not devices:
+        raise AppError(f"VM {name} has no recorded single-GPU passthrough devices.")
+    if _qemu_running(name):
+        raise AppError(f"VM {name} is still running; shut it down before reclaiming its GPU.")
+    stale_nvidia = [
+        device for device in devices
+        if _driver_module(device) == "nvidia"
+        and _bound_driver(PCI_DEVICES_ROOT / f"0000:{device.address}") != "nvidia"
+        and (SYS_MODULE_ROOT / "nvidia").exists()
+    ]
+    if stale_nvidia:
+        for device in devices:
+            _clear_driver_override(device)
+        addresses = ", ".join(f"0000:{device.address}" for device in stale_nvidia)
+        raise AppError(
+            f"NVIDIA is still loaded after {addresses} was detached. Its kernel state may be stale; "
+            "driver_override was cleared, but a reboot is required before starting the VM again."
+        )
+    runner.run(["systemctl", "stop", "display-manager.service"], check=False)
+    runner.run(["systemctl", "stop", "nvidia-persistenced.service"], check=False)
+    errors: list[str] = []
+    restored: list[str] = []
+    for device in devices:
+        try:
+            restored.append(_restore_device(device, runner))
+        except AppError as exc:
+            errors.append(str(exc))
+    if "nvidia" in restored:
+        runner.run(["modprobe", "nvidia_drm"], check=False)
+    for bind in VTCON_ROOT.glob("vtcon*/bind"):
+        _write_optional(bind, "1")
+    _write_optional(EFI_FRAMEBUFFER_BIND, "efi-framebuffer.0")
+    if errors:
+        raise AppError(
+            "Host display recovery was incomplete; display-manager was left stopped and a reboot is recommended:\n- "
+            + "\n- ".join(errors)
+        )
+    runner.run(["systemctl", "daemon-reload"], check=False)
+    runner.run(["systemctl", "start", "nvidia-persistenced.service"], check=False)
+    runner.run(["systemctl", "restart", "display-manager.service"], check=False)
+    runner.run(["systemctl", "is-active", "--quiet", "display-manager.service"], check=False)
+    _reactivate_graphical_seat(runner)
+    print(f"{name}: host GPU drivers restored; display-manager restarted.")
+
+
+def install_dynamic_hooks(vm_name: str) -> None:
+    require_root()
+    name = valid_vm_name(vm_name)
+    quoted = shlex.quote(name)
+    body = f"""
+[[ "${{1:-}}" == {quoted} ]] || exit 0
+case "${{2:-}}:${{3:-}}" in
+  prepare:begin)
+    /usr/local/sbin/kvm-aavm mark-pending --vm {quoted}
+    ;;
+  release:end)
+    systemd-run --quiet --collect --on-active=3s --unit=kvm-aavm-randomize-{name} /usr/local/sbin/kvm-aavm randomize-xml --vm {quoted}
+    ;;
+esac
+"""
+    _write_hook(HOOK_ROOT / name / "05-dynamic-randomization", body)
+    _remove_legacy([
+        LEGACY_HOOK_ROOT / name / "prepare" / "begin" / "05-kvm-aavm-generation",
+        LEGACY_HOOK_ROOT / name / "release" / "end" / "95-kvm-aavm-randomize",
+    ])
+
+
+def remove_dynamic_hooks(vm_name: str) -> None:
+    name = valid_vm_name(vm_name)
+    (HOOK_ROOT / name / "05-dynamic-randomization").unlink(missing_ok=True)
+    _remove_legacy([
+        LEGACY_HOOK_ROOT / name / "prepare" / "begin" / "05-kvm-aavm-generation",
+        LEGACY_HOOK_ROOT / name / "release" / "end" / "95-kvm-aavm-randomize",
+    ])
+
+
+def install_performance_hook(vm_name: str) -> None:
+    """Use the host's performance EPP/governor only while managed VMs run."""
+    require_root()
+    name = valid_vm_name(vm_name)
+    quoted = shlex.quote(name)
+    body = f'''
+[[ "${{1:-}}" == {quoted} ]] || exit 0
+state=/run/kvm-aavm-performance
+marker="$state/active-{name}"
+mkdir -p "$state"
+exec 9>"$state/lock"
+flock 9
+activate() {{
+  if ! compgen -G "$state/active-*" >/dev/null; then
+    : > "$state/saved.new"
+    for path in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor \
+                /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference; do
+      [[ -r "$path" ]] || continue
+      printf '%s\\t%s\\n' "$path" "$(<"$path")" >> "$state/saved.new"
+    done
+    mv "$state/saved.new" "$state/saved"
+  fi
+  touch "$marker"
+  for path in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+    [[ -w "$path" ]] && printf '%s' performance > "$path" || true
+  done
+  for path in /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference; do
+    [[ -w "$path" ]] && printf '%s' performance > "$path" || true
+  done
+}}
+deactivate() {{
+  rm -f "$marker"
+  if ! compgen -G "$state/active-*" >/dev/null && [[ -r "$state/saved" ]]; then
+    while IFS=$'\\t' read -r path value; do
+      [[ -w "$path" ]] && printf '%s' "$value" > "$path" || true
+    done < "$state/saved"
+    rm -f "$state/saved"
+  fi
+}}
+case "${{2:-}}:${{3:-}}" in
+  prepare:begin) activate ;;
+  stopped:end|release:end) deactivate ;;
+esac
+'''
+    _write_hook(HOOK_ROOT / name / "10-host-performance", body)
+
+
+def remove_single_gpu_hooks(vm_name: str) -> None:
+    require_root()
+    name = valid_vm_name(vm_name)
+    (HOOK_ROOT / name / "20-single-gpu").unlink(missing_ok=True)
+    _remove_legacy([
+        LEGACY_HOOK_ROOT / name / "prepare" / "begin" / "20-single-gpu",
+        LEGACY_HOOK_ROOT / name / "release" / "end" / "20-single-gpu",
+    ])
+
+
+def install_single_gpu_hooks(
+    vm_name: str, devices: list[PciDevice], *, force_bus_reset: bool = False,
+) -> None:
+    require_root()
+    name = valid_vm_name(vm_name)
+    if not devices:
+        raise AppError("At least one GPU PCI function is required.")
+    quoted = shlex.quote(name)
+    unload = " ".join(shlex.quote(module) for module in _gpu_unload_modules(devices))
+    restore_lines: list[str] = []
+    restored_modules: list[str] = []
+    for device in devices:
+        module = _driver_module(device)
+        address = f"0000:{device.address}"
+        restore_lines.extend([
+            f"  dev=/sys/bus/pci/devices/{address}",
+            f"  if [[ -L \"$dev/driver\" && \"$(basename \"$(readlink \"$dev/driver\")\")\" == vfio-pci ]]; then echo {address} > \"$dev/driver/unbind\" || true; fi",
+            "  [[ -w \"$dev/driver_override\" ]] && echo > \"$dev/driver_override\" || true",
+        ])
+        if module is not None:
+            restore_lines.extend([
+                f"  modprobe {shlex.quote(module)} || true",
+                f"  echo {address} > /sys/bus/pci/drivers_probe || true",
+            ])
+            if module not in restored_modules:
+                restored_modules.append(module)
+    if "nvidia" in restored_modules:
+        restore_lines.append("  modprobe nvidia_drm || true")
+    restore_devices = "\n".join(restore_lines)
+    unbind_lines: list[str] = []
+    bind_lines: list[str] = []
+    for device in devices:
+        address = f"0000:{device.address}"
+        unbind_lines.extend([
+            f"    dev=/sys/bus/pci/devices/{address}",
+            f"    if [[ -L \"$dev/driver\" && \"$(basename \"$(readlink \"$dev/driver\")\")\" != vfio-pci ]]; then echo {address} > \"$dev/driver/unbind\" || failed=1; fi",
+        ])
+        bind_lines.extend([
+            f"  dev=/sys/bus/pci/devices/{address}",
+            "  [[ -w \"$dev/driver_override\" ]] && echo vfio-pci > \"$dev/driver_override\" || failed=1",
+            f"  echo {address} > /sys/bus/pci/drivers_probe || failed=1",
+            "  [[ -L \"$dev/driver\" && \"$(basename \"$(readlink \"$dev/driver\")\")\" == vfio-pci ]] || failed=1",
+        ])
+    unbind_devices = "\n".join(unbind_lines)
+    bind_devices = "\n".join(bind_lines)
+    bus_reset_lines: list[str] = []
+    if force_bus_reset:
+        for device in devices:
+            if not device.class_code.startswith("03"):
+                continue
+            address = f"0000:{device.address}"
+            bus_reset_lines.extend([
+                f"  dev=/sys/bus/pci/devices/{address}",
+                "  if [[ -w \"$dev/reset_method\" ]] && grep -qw bus \"$dev/reset_method\"; then",
+                "    echo bus > \"$dev/reset_method\" || failed=1",
+                "  else",
+                "    failed=1",
+                "  fi",
+                "  [[ -w \"$dev/reset\" ]] && echo 1 > \"$dev/reset\" || failed=1",
+            ])
+    if bus_reset_lines:
+        bus_reset_lines.extend([
+            "  if (( failed )); then",
+            '    echo "Requested PCIe bus reset is unavailable; restoring the host"',
+            "    restore_host",
+            "    exit 1",
+            "  fi",
+            "  sleep 1",
+        ])
+    bus_reset_devices = "\n".join(bus_reset_lines)
+    body = f"""
+[[ "${{1:-}}" == {quoted} ]] || exit 0
+exec >>/var/log/libvirt/qemu/{name}-gpu-hook.log 2>&1
+reactivate_graphical_seat() {{
+  local session tty uid user auth output attempt
+  for attempt in {{1..30}}; do
+    session="$(loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null || true)"
+    [[ -n "$session" ]] && break
+    sleep 0.25
+  done
+  [[ -n "${{session:-}}" ]] || return 0
+  tty="$(loginctl show-session "$session" -p TTY --value 2>/dev/null || true)"
+  if [[ "$tty" =~ ^tty([0-9]+)$ ]]; then chvt "${{BASH_REMATCH[1]}}" || true; fi
+  command -v xrandr >/dev/null 2>&1 || return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  uid="$(loginctl show-session "$session" -p User --value 2>/dev/null || true)"
+  user="$(loginctl show-session "$session" -p Name --value 2>/dev/null || true)"
+  [[ "$uid" =~ ^[0-9]+$ && -n "$user" ]] || return 0
+  auth="/run/user/$uid/gdm/Xauthority"
+  outputs=()
+  for attempt in {{1..40}}; do
+    if [[ ! -r "$auth" ]]; then auth="$(getent passwd "$uid" | cut -d: -f6)/.Xauthority"; fi
+    mapfile -t outputs < <(runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xrandr --query 2>/dev/null | awk '$2 == "connected" {{print $1}}')
+    ((${{#outputs[@]}})) && break
+    sleep 0.25
+  done
+  ((${{#outputs[@]}})) || return 0
+  sleep 3
+  for output in "${{outputs[@]}}"; do
+    runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xrandr --output "$output" --off || true
+  done
+  sleep 1
+  for output in "${{outputs[@]}}"; do
+    runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xrandr --output "$output" --preferred || true
+  done
+  runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xset dpms force on 2>/dev/null || true
+}}
+deactivate_graphical_outputs() {{
+  local session uid user auth output
+  session="$(loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null || true)"
+  [[ -n "$session" ]] || return 0
+  command -v xrandr >/dev/null 2>&1 || return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  uid="$(loginctl show-session "$session" -p User --value 2>/dev/null || true)"
+  user="$(loginctl show-session "$session" -p Name --value 2>/dev/null || true)"
+  [[ "$uid" =~ ^[0-9]+$ && -n "$user" ]] || return 0
+  auth="/run/user/$uid/gdm/Xauthority"
+  [[ -r "$auth" ]] || auth="$(getent passwd "$uid" | cut -d: -f6)/.Xauthority"
+  [[ -r "$auth" ]] || return 0
+  mapfile -t outputs < <(runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xrandr --query 2>/dev/null | awk '$2 == "connected" {{print $1}}')
+  for output in "${{outputs[@]}}"; do
+    runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xrandr --output "$output" --off || true
+  done
+  sleep 1
+}}
+restore_host() {{
+  echo "$(date -Is) restoring host GPU"
+{restore_devices}
+  for vt in /sys/class/vtconsole/vtcon*/bind; do [[ -w "$vt" ]] && echo 1 > "$vt" || true; done
+  if [[ -w /sys/bus/platform/drivers/efi-framebuffer/bind ]]; then echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind || true; fi
+  systemctl daemon-reload || true
+  systemctl start nvidia-persistenced.service || true
+  systemctl restart display-manager.service || true
+  systemctl is-active --quiet display-manager.service || true
+  reactivate_graphical_seat
+}}
+case "${{2:-}}:${{3:-}}" in
+  prepare:begin)
+    echo "$(date -Is) releasing host GPU"
+    systemctl daemon-reload || true
+    deactivate_graphical_outputs
+    systemctl stop display-manager.service
+    systemctl stop nvidia-persistenced.service || true
+    # GDM's autologin session can outlive display-manager.service on Ubuntu.
+    # Terminate only the local graphical seat; SSH sessions have no seat and
+    # remain available while the single physical GPU belongs to the guest.
+    if command -v loginctl >/dev/null 2>&1; then
+      loginctl terminate-seat seat0 || true
+    fi
+    for vt in /sys/class/vtconsole/vtcon*/bind; do [[ -w "$vt" ]] && echo 0 > "$vt" || true; done
+    if [[ -w /sys/bus/platform/drivers/efi-framebuffer/unbind ]]; then echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind || true; fi
+    # A bound DRM/fbdev device holds its vendor modules even after the GUI has
+    # exited.  Unbind every selected PCI function before module removal.
+    failed=0
+{unbind_devices}
+    if (( failed )); then
+      echo "GPU device unbind failed; aborting VM start and restoring the host"
+      restore_host
+      exit 1
+    fi
+    failed=1
+    for attempt in {{1..40}}; do
+      failed=0
+      for module in {unload}; do
+        [[ -d "/sys/module/$module" ]] || continue
+        modprobe -r "$module" || failed=1
+      done
+      (( failed )) || break
+      sleep 0.25
+    done
+    if (( failed )); then
+      echo "GPU module unload failed; aborting VM start and restoring the host"
+      restore_host
+      exit 1
+    fi
+    modprobe vfio-pci || {{ restore_host; exit 1; }}
+    failed=0
+{bind_devices}
+    if (( failed )); then
+      echo "Could not bind every selected GPU function to vfio-pci"
+      restore_host
+      exit 1
+    fi
+{bus_reset_devices}
+    ;;
+  release:end)
+    restore_host
+    ;;
+esac
+"""
+    _write_hook(HOOK_ROOT / name / "20-single-gpu", body)
+    _remove_legacy([
+        LEGACY_HOOK_ROOT / name / "prepare" / "begin" / "20-single-gpu",
+        LEGACY_HOOK_ROOT / name / "release" / "end" / "20-single-gpu",
+    ])

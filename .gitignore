@@ -1,0 +1,44 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local patch-tool backups and temporary build output
+*.orig
+*.rej
+config.log
+config-temp/
+.kvm-*.cmd
+.kvm-*.ps1
+
+# Per-machine deployment state and VM disk images
+*.qcow2
+*.img
+*.iso
+*.fd
+*.vars
+*.nvram
+
+# Offline bundle payloads are intentionally kept outside Git. They are
+# recreated from the tracked preparation scripts and package roots list.
+/offline/.bootstrap/
+/offline/debs/
+/offline/sources/
+/offline/manifest.json
+/offline/memflow-source-only.dkms.tar.gz
+/offline/windows/nvidia/*.exe
+
+# Locally supplied install media and unrelated archived tools
+/KVM/*.iso
+/KVM/*.rar
+
+# Prebuilt/local tools not used by the Ubuntu deployer source
+/nika
+/nika.ini
+/items.ini
+/weapons.ini
+/offsets.ini
+/keys.txt
+/libmemflow_*.so
