@@ -905,6 +905,29 @@ class OfflineTests(unittest.TestCase):
         self.assertIn("swtpm swtpm-tools libtpms0", script)
         self.assertIn('prune_superseded_debs.py" "$DEB_DIR"', script)
 
+    def test_offline_bundle_retains_canonical_linux_722_tarball(self):
+        script = (
+            Path(__file__).parents[1] / "tools" / "prepare_offline_rootless.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('KERNEL_TEST_VERSION="7.2.2"', script)
+        self.assertIn(
+            'KERNEL_TEST_ARCHIVE_NAME="linux-${KERNEL_TEST_VERSION}.tar.xz"', script
+        )
+        self.assertIn(
+            'https://cdn.kernel.org/pub/linux/kernel/v7.x/${KERNEL_TEST_ARCHIVE_NAME}',
+            script,
+        )
+        self.assertIn(
+            (
+                'KERNEL_TEST_ARCHIVE_SHA256='
+                '"7d0e7ce14f98c43efe880cffbf354a59be45928fdf7170d7333c374ae91c0d83"'
+            ),
+            script,
+        )
+        self.assertIn('tar -xJOf "$archive" "${KERNEL_TEST_TOPDIR}/Makefile"', script)
+        self.assertIn('tar -xJf "$KERNEL_TEST_ARCHIVE" --no-same-owner', script)
+        self.assertNotIn('clone_or_reuse "$SOURCE_DIR/linux-7.2"', script)
+
     def test_amd_swtpm_runtime_profile_preserves_unrelated_settings(self):
         setup = offline._replace_managed_swtpm_setup(
             "# local setting\nactive_pcr_banks = sha256\ncreate_certs_tool = /custom/tool\n"

@@ -7,7 +7,13 @@ OFFLINE_DIR="${PROJECT_DIR}/offline"
 DEB_DIR="${OFFLINE_DIR}/debs"
 SOURCE_DIR="${OFFLINE_DIR}/sources"
 BOOTSTRAP_DIR="${OFFLINE_DIR}/.bootstrap"
-KERNEL_TEST_REF="${KVM_AAVM_KERNEL_TEST_REF:-v7.2.2}"
+KERNEL_TEST_VERSION="7.2.2"
+KERNEL_TEST_ARCHIVE_NAME="linux-${KERNEL_TEST_VERSION}.tar.xz"
+KERNEL_TEST_ARCHIVE_URL="https://cdn.kernel.org/pub/linux/kernel/v7.x/${KERNEL_TEST_ARCHIVE_NAME}"
+KERNEL_TEST_ARCHIVE_SHA256="7d0e7ce14f98c43efe880cffbf354a59be45928fdf7170d7333c374ae91c0d83"
+KERNEL_TEST_ARCHIVE="${SOURCE_DIR}/${KERNEL_TEST_ARCHIVE_NAME}"
+KERNEL_TEST_TOPDIR="linux-${KERNEL_TEST_VERSION}"
+KERNEL_TEST_SOURCE="${SOURCE_DIR}/linux-7.2"
 
 if [[ "$({ . /etc/os-release; printf '%s' "${ID}:${VERSION_ID}"; })" != "ubuntu:24.04" ]]; then
   echo "This bundle must be prepared on Ubuntu 24.04." >&2
@@ -90,23 +96,105 @@ clone_or_reuse() {
   git_run clone "$@" "$remote" "$path"
 }
 
+kernel_722_makefile_is_valid() {
+  local makefile="$1"
+  [[ -f "$makefile" ]] || return 1
+
+  awk '
+    /^VERSION[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      version = $0
+    }
+    /^PATCHLEVEL[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      patchlevel = $0
+    }
+    /^SUBLEVEL[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      sublevel = $0
+    }
+    /^EXTRAVERSION[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      extraversion = $0
+    }
+    END {
+      exit !(version == "7" && patchlevel == "2" && sublevel == "2" && extraversion == "")
+    }
+  ' "$makefile"
+}
+
+kernel_722_archive_is_valid() {
+  local archive="$1"
+  local archive_makefile
+
+  [[ -f "$archive" ]] || return 1
+  [[ "$(sha256sum "$archive" | awk '{print $1}')" == "$KERNEL_TEST_ARCHIVE_SHA256" ]] || return 1
+  tar -tJf "$archive" | awk -v topdir="$KERNEL_TEST_TOPDIR" '
+    $0 == topdir "/Makefile" { makefile = 1 }
+    $0 != topdir && index($0, topdir "/") != 1 { unexpected = 1 }
+    END { exit !(makefile && !unexpected) }
+  ' || return 1
+
+  archive_makefile="$(mktemp "${SOURCE_DIR}/.${KERNEL_TEST_TOPDIR}-Makefile.XXXXXX")"
+  if ! tar -xJOf "$archive" "${KERNEL_TEST_TOPDIR}/Makefile" > "$archive_makefile" \
+      || ! kernel_722_makefile_is_valid "$archive_makefile"; then
+    rm -f -- "$archive_makefile"
+    return 1
+  fi
+  rm -f -- "$archive_makefile"
+}
+
+ensure_linux_722_archive() {
+  local temporary
+
+  if kernel_722_archive_is_valid "$KERNEL_TEST_ARCHIVE"; then
+    echo "Reusing verified Linux ${KERNEL_TEST_VERSION} archive: $KERNEL_TEST_ARCHIVE"
+    return
+  fi
+
+  temporary="$(mktemp "${SOURCE_DIR}/.${KERNEL_TEST_ARCHIVE_NAME}.XXXXXX")"
+  if ! curl --fail --location --retry 3 --output "$temporary" "$KERNEL_TEST_ARCHIVE_URL" \
+      || ! kernel_722_archive_is_valid "$temporary"; then
+    rm -f -- "$temporary"
+    echo "Could not download a valid Linux ${KERNEL_TEST_VERSION} archive." >&2
+    exit 1
+  fi
+  mv -f -- "$temporary" "$KERNEL_TEST_ARCHIVE"
+  echo "Downloaded verified Linux ${KERNEL_TEST_VERSION} archive: $KERNEL_TEST_ARCHIVE"
+}
+
+extract_linux_722_source() {
+  local temporary_dir
+  local extracted_source
+
+  if [[ -e "$KERNEL_TEST_SOURCE" ]]; then
+    if ! kernel_722_makefile_is_valid "$KERNEL_TEST_SOURCE/Makefile"; then
+      echo "Existing Linux 7.2 source is not v${KERNEL_TEST_VERSION}: $KERNEL_TEST_SOURCE" >&2
+      exit 1
+    fi
+    echo "Reusing verified content-only source: $KERNEL_TEST_SOURCE"
+    return
+  fi
+
+  temporary_dir="$(mktemp -d "${SOURCE_DIR}/.linux-7.2.XXXXXX")"
+  extracted_source="${temporary_dir}/${KERNEL_TEST_TOPDIR}"
+  if ! tar -xJf "$KERNEL_TEST_ARCHIVE" --no-same-owner --directory="$temporary_dir" \
+      || ! kernel_722_makefile_is_valid "$extracted_source/Makefile"; then
+    rm -rf -- "$temporary_dir"
+    echo "Could not extract a valid Linux ${KERNEL_TEST_VERSION} source tree." >&2
+    exit 1
+  fi
+  mv -- "$extracted_source" "$KERNEL_TEST_SOURCE"
+  rmdir -- "$temporary_dir"
+  echo "Extracted Linux ${KERNEL_TEST_VERSION} source: $KERNEL_TEST_SOURCE"
+}
+
 clone_or_reuse "$SOURCE_DIR/qemu" https://github.com/qemu/qemu.git stable-11.0 --depth 1 --single-branch --branch stable-11.0
 clone_or_reuse "$SOURCE_DIR/edk2" https://github.com/tianocore/edk2.git edk2-stable202602 --depth 1 --recursive --shallow-submodules --single-branch --branch edk2-stable202602
 clone_or_reuse "$SOURCE_DIR/linux-tkg" https://github.com/Frogging-Family/linux-tkg.git "" --depth 1
 clone_or_reuse "$SOURCE_DIR/linux" https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git v6.19 --depth 1 --single-branch --branch v6.19
-
-if [[ -e "$SOURCE_DIR/linux-7.2" ]]; then
-  if [[ "$(sed -n -E 's/^VERSION[[:space:]]*=[[:space:]]*//p' "$SOURCE_DIR/linux-7.2/Makefile" 2>/dev/null)" != "7" \
-      || "$(sed -n -E 's/^PATCHLEVEL[[:space:]]*=[[:space:]]*//p' "$SOURCE_DIR/linux-7.2/Makefile" 2>/dev/null)" != "2" \
-      || "$(sed -n -E 's/^SUBLEVEL[[:space:]]*=[[:space:]]*//p' "$SOURCE_DIR/linux-7.2/Makefile" 2>/dev/null)" != "2" \
-      || -n "$(sed -n -E 's/^EXTRAVERSION[[:space:]]*=[[:space:]]*//p' "$SOURCE_DIR/linux-7.2/Makefile" 2>/dev/null)" ]]; then
-    echo "Existing Linux 7.2 source is not v7.2.2: $SOURCE_DIR/linux-7.2" >&2
-    exit 1
-  fi
-  echo "Reusing verified content-only source: $SOURCE_DIR/linux-7.2"
-else
-  clone_or_reuse "$SOURCE_DIR/linux-7.2" https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git "$KERNEL_TEST_REF" --depth 1 --single-branch --branch "$KERNEL_TEST_REF"
-fi
+ensure_linux_722_archive
+extract_linux_722_source
 clone_or_reuse "$SOURCE_DIR/libtpms" https://github.com/stefanberger/libtpms.git v0.9.3 --depth 1 --single-branch --branch v0.9.3
 
 curl --fail --location --output "$OFFLINE_DIR/memflow-source-only.dkms.tar.gz" \

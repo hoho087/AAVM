@@ -588,7 +588,9 @@ Ubuntu 核心只有在這張 Machine Owner Key 已登錄後才允許載入。部
 6.19 補丁不會被自動重用，避免在 KVM 結構變動後產生可開機但行為錯誤的核心。
 
 若部署包尚未包含 Linux 7.2.2，準備新的離線包時，
-`tools/prepare_offline.sh` 會另外固定抓取 `v7.2.2` 到 `offline/sources/linux-7.2`；
+`tools/prepare_offline.sh` 會從 kernel.org 固定下載並保留
+`offline/sources/linux-7.2.2.tar.xz`（SHA-256 固定驗證），驗證後解壓到
+`offline/sources/linux-7.2`；
 目前部署器 profile 固定為 7.2.2；其他 point release 必須先有相容的 CPU 補丁並同步更新 profile，
 不會只靠環境變數繞過版本檢查。
 部署端不會下載或回退到其他版本，缺少 source／port 補丁時會在編譯前停止。

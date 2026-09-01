@@ -2,7 +2,8 @@
 
 Run `tools/prepare_offline.sh` **once on an online, clean Ubuntu 24.04 amd64
 machine**. It fills this directory with the complete DEB dependency closure,
-fixed QEMU/OVMF/Linux source trees, the optional Linux `v7.2.2` test source,
+fixed QEMU/OVMF/Linux source trees, the optional Linux `v7.2.2` test archive
+from kernel.org and its extracted test source,
 the pinned `libtpms v0.9.3` source used for the AMD fTPM capability profile,
 memflow DKMS archive, and `manifest.json` checksums.
 The deployer profile is currently pinned to `v7.2.2`; preparing another point
@@ -31,3 +32,10 @@ The 7.2 source is optional for normal deployment but required by the deployer
 menu's experimental 7.2 kernel action. That action also requires a separately
 ported `amd72-test.mypatch` or `intel72-test.mypatch`; the stable 6.19 patches
 are never reused automatically.
+
+The bundle retains `sources/linux-7.2.2.tar.xz` from
+`https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.2.tar.xz` and extracts
+it to `sources/linux-7.2` for the kernel builder. Its SHA-256 is pinned to
+`7d0e7ce14f98c43efe880cffbf354a59be45928fdf7170d7333c374ae91c0d83`.
+Both are verified during
+preparation and covered by `manifest.json`, so deployment remains network-free.
