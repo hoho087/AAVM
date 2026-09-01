@@ -1357,22 +1357,26 @@ class HookTests(unittest.TestCase):
             self.assertIn("driver_override", script_text)
             self.assertIn("echo vfio-pci", script_text)
             self.assertIn("loginctl terminate-seat seat0", script_text)
-            self.assertIn("for attempt in {1..40}", script_text)
+            self.assertIn("for attempt in {1..8}", script_text)
             self.assertIn('[[ -d "/sys/module/$module" ]] || continue', script_text)
             self.assertIn(
                 "timeout --signal=TERM --kill-after=2s 5s modprobe -r",
                 script_text,
             )
-            self.assertIn("Timed out unloading GPU module $module", script_text)
+            self.assertIn(
+                "GPU client modules remain loaded; continuing with PCI unbind",
+                script_text,
+            )
+            self.assertIn(
+                "GPU vendor modules remain loaded after PCI unbind; continuing with VFIO",
+                script_text,
+            )
             self.assertIn(
                 "timeout --signal=TERM --kill-after=2s 15s",
                 script_text,
             )
-            self.assertIn(
-                '[[ "$(cat /sys/module/nvidia/refcnt)" != 0 ]]',
-                script_text,
-            )
-            self.assertIn("NVIDIA core module is still referenced", script_text)
+            self.assertNotIn("nvidia_refcnt", script_text)
+            self.assertNotIn("NVIDIA core module is still referenced", script_text)
             prepare_offset = script_text.index("prepare:begin)")
             client_unload_offset = script_text.index(
                 "unload_gpu_modules nvidia_drm nvidia_modeset nvidia_uvm",
@@ -3153,6 +3157,55 @@ class CliTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_install_application_refreshes_existing_single_gpu_hook(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            (project / "kvm_aavm").mkdir(parents=True)
+            (project / "kvm_aavm" / "marker.py").write_text("# test\n", encoding="utf-8")
+            (project / "deploy.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            state = root / "state"
+            profile_root = state / "vms" / "win11"
+            profile_root.mkdir(parents=True)
+            value = profile()
+            value["name"] = "win11"
+            value["host"]["pci"] = [{
+                "address": "01:00.0",
+                "class_code": "0300",
+                "vendor_id": "10de",
+                "device_id": "1234",
+                "description": "Test GPU",
+                "driver": "nvidia",
+            }]
+            value["passthrough"] = {
+                "mode": "single-gpu",
+                "gpu_pci": ["01:00.0"],
+                "gpu_reset_method": "default",
+            }
+            profile_root.joinpath("profile.json").write_text(
+                json.dumps(value), encoding="utf-8",
+            )
+            runner = Mock()
+            with patch.object(host, "PROJECT_DIR", project), \
+                    patch.object(host, "PREFIX", root / "prefix"), \
+                    patch.object(host, "STATE_DIR", state), \
+                    patch.object(host, "require_root"), \
+                    patch.object(host, "remove_obsolete_oneshot_support"), \
+                    patch.object(host, "configure_apparmor"), \
+                    patch.object(host, "configure_virt_manager"), \
+                    patch.object(host, "verify_spice_console_runtime"), \
+                    patch.object(host, "configure_libvirt_hooks"), \
+                    patch.object(host, "update_host_state"), \
+                    patch.object(host, "ensure_state_dirs"), \
+                    patch.object(host, "atomic_write"), \
+                    patch.object(hooks, "install_performance_hook") as performance, \
+                    patch.object(hooks, "install_single_gpu_hooks") as gpu_hook:
+                host.install_application(runner)
+            performance.assert_called_once_with("win11")
+            gpu_hook.assert_called_once()
+            self.assertEqual(gpu_hook.call_args.args[0], "win11")
+            self.assertEqual(gpu_hook.call_args.args[1][0].address, "01:00.0")
+
     def test_amd_host_config_explicitly_enables_avic(self):
         self.assertEqual(
             _managed_kvm_module_config("amd"),

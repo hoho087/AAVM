@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shlex
 import shutil
 import sys
 from pathlib import Path
 
-from .hardware import cpu_info
+from .hardware import PciDevice, cpu_info
 from .paths import PREFIX, PROJECT_DIR, STATE_DIR, ensure_state_dirs
 from .state import load_host_state, update_host_state
 from .util import AppError, Runner, atomic_write, command_exists, require_root
@@ -352,12 +353,35 @@ def install_application(runner: Runner) -> None:
     configure_libvirt_hooks(runner)
     # Existing managed VMs receive the same runtime power policy as newly
     # created ones when option 1 updates the deployer.
-    from .hooks import install_performance_hook
+    from .hooks import install_performance_hook, install_single_gpu_hooks
     for profile in sorted((STATE_DIR / "vms").glob("*/profile.json")):
         try:
-            install_performance_hook(profile.parent.name)
+            name = profile.parent.name
+            install_performance_hook(name)
+            # Re-render per-VM GPU hooks as part of an application update.
+            # Hook files live under /etc and otherwise remain on the old
+            # generator version after upgrading the deployer package.
+            data = json.loads(profile.read_text(encoding="utf-8"))
+            passthrough = data.get("passthrough", {})
+            if passthrough.get("mode") == "single-gpu" and passthrough.get("gpu_pci"):
+                by_address = {
+                    item["address"]: PciDevice(**item)
+                    for item in data.get("host", {}).get("pci", [])
+                    if isinstance(item, dict) and item.get("address")
+                }
+                devices = [by_address[address] for address in passthrough["gpu_pci"] if address in by_address]
+                if len(devices) == len(passthrough["gpu_pci"]):
+                    install_single_gpu_hooks(
+                        name,
+                        devices,
+                        force_bus_reset=passthrough.get("gpu_reset_method") == "bus",
+                    )
+                else:
+                    print(f"Skipping GPU hook refresh for {name}: saved PCI data is incomplete.")
         except AppError as exc:
             print(f"Skipping performance hook for {profile.parent.name}: {exc}")
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            print(f"Skipping hook refresh for {profile.parent.name}: {exc}")
     update_host_state(application_installed=True, project_dir=str(PROJECT_DIR))
 
 

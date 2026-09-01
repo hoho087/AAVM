@@ -362,15 +362,6 @@ def install_single_gpu_hooks(
         shlex.quote(module) for module in unload_modules
         if module not in {"nvidia_drm", "nvidia_modeset", "nvidia_uvm"}
     )
-    nvidia_ref_guard = ""
-    if "nvidia" in unload_modules:
-        nvidia_ref_guard = """
-    if [[ -r /sys/module/nvidia/refcnt ]] &&
-       [[ "$(cat /sys/module/nvidia/refcnt)" != 0 ]]; then
-      echo "NVIDIA core module is still referenced after client unload; aborting VM start and restoring the host"
-      exit 1
-    fi
-""".rstrip()
     restore_lines: list[str] = []
     restored_modules: list[str] = []
     for device in devices:
@@ -378,7 +369,7 @@ def install_single_gpu_hooks(
         address = f"0000:{device.address}"
         restore_lines.extend([
             f"  dev=/sys/bus/pci/devices/{address}",
-            f"  if [[ -L \"$dev/driver\" && \"$(basename \"$(readlink \"$dev/driver\")\")\" == vfio-pci ]]; then echo {address} > \"$dev/driver/unbind\" || true; fi",
+            f"  if [[ -L \"$dev/driver\" && \"$(basename \"$(readlink \"$dev/driver\")\")\" == vfio-pci ]]; then printf '%s' {address} > \"$dev/driver/unbind\" 2>/dev/null || true; fi",
             "  [[ -w \"$dev/driver_override\" ]] && echo > \"$dev/driver_override\" || true",
         ])
         if module is not None:
@@ -439,18 +430,26 @@ handoff_committed=0
 bounded() {{
   timeout --signal=TERM --kill-after=5s "$@"
 }}
+bind_efi_framebuffer() {{
+  local bind=/sys/bus/platform/drivers/efi-framebuffer/bind
+  local device=/sys/bus/platform/devices/efi-framebuffer.0
+  [[ -w "$bind" && -e "$device" ]] || return 0
+  printf '%s' efi-framebuffer.0 > "$bind" 2>/dev/null || true
+}}
 unload_gpu_modules() {{
   local attempt module failed status
   (($#)) || return 0
   failed=1
-  for attempt in {{1..40}}; do
+  # NVIDIA can keep its modules referenced by DRM even after the graphical
+  # session is gone.  Module removal is an optimization; PCI unbind below is
+  # the operation required for the managed libvirt hostdev handoff.
+  for attempt in {{1..8}}; do
     failed=0
     for module in "$@"; do
       [[ -d "/sys/module/$module" ]] || continue
-      timeout --signal=TERM --kill-after=2s 5s modprobe -r "$module" || {{
+      timeout --signal=TERM --kill-after=2s 5s modprobe -r "$module" 2>/dev/null || {{
         status=$?
         if (( status == 124 || status == 137 )); then
-          echo "Timed out unloading GPU module $module"
           return 1
         fi
         failed=1
@@ -525,7 +524,7 @@ restore_host() {{
 {restore_devices}
   if command -v udevadm >/dev/null 2>&1; then udevadm settle --timeout=10 || true; fi
   for vt in /sys/class/vtconsole/vtcon*/bind; do [[ -w "$vt" ]] && echo 1 > "$vt" || true; done
-  if [[ -w /sys/bus/platform/drivers/efi-framebuffer/bind ]]; then echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind || true; fi
+  bind_efi_framebuffer
   systemctl daemon-reload || true
   bounded 20s systemctl start nvidia-persistenced.service || true
   bounded 30s systemctl restart display-manager.service || true
@@ -548,7 +547,7 @@ case "${{2:-}}:${{3:-}}" in
     systemctl daemon-reload || true
     handoff_started=1
     deactivate_graphical_outputs
-    bounded 30s systemctl stop display-manager.service
+    bounded 30s systemctl stop display-manager.service || true
     bounded 20s systemctl stop nvidia-persistenced.service || true
     # GDM's autologin session can outlive display-manager.service on Ubuntu.
     # Terminate only the local graphical seat; SSH sessions have no seat and
@@ -557,14 +556,14 @@ case "${{2:-}}:${{3:-}}" in
       bounded 15s loginctl terminate-seat seat0 || true
     fi
     for vt in /sys/class/vtconsole/vtcon*/bind; do [[ -w "$vt" ]] && echo 0 > "$vt" || true; done
-    if [[ -w /sys/bus/platform/drivers/efi-framebuffer/unbind ]]; then echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind || true; fi
-    # NVIDIA's core PCI remove path must not run while DRM/modeset/UVM still
-    # holds it.  Other vendors have no pre-unbind client module list.
-    if ! unload_gpu_modules {pre_unbind_modules}; then
-      echo "GPU client module unload failed; aborting VM start and restoring the host"
-      exit 1
+    if [[ -w /sys/bus/platform/drivers/efi-framebuffer/unbind && -e /sys/bus/platform/devices/efi-framebuffer.0 ]]; then
+      printf '%s' efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind 2>/dev/null || true
     fi
-{nvidia_ref_guard}
+    # Module removal is best effort.  A loaded vendor module is harmless once
+    # the selected PCI functions are detached and handed to vfio-pci.
+    if ! unload_gpu_modules {pre_unbind_modules}; then
+      echo "GPU client modules remain loaded; continuing with PCI unbind"
+    fi
     failed=0
 {unbind_devices}
     if (( failed )); then
@@ -572,8 +571,7 @@ case "${{2:-}}:${{3:-}}" in
       exit 1
     fi
     if ! unload_gpu_modules {post_unbind_modules}; then
-      echo "GPU core module unload failed; aborting VM start and restoring the host"
-      exit 1
+      echo "GPU vendor modules remain loaded after PCI unbind; continuing with VFIO"
     fi
     if ! modprobe vfio-pci; then
       echo "Could not load vfio-pci; aborting VM start and restoring the host"
