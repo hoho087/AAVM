@@ -7,6 +7,7 @@ OFFLINE_DIR="${PROJECT_DIR}/offline"
 DEB_DIR="${OFFLINE_DIR}/debs"
 SOURCE_DIR="${OFFLINE_DIR}/sources"
 BOOTSTRAP_DIR="${OFFLINE_DIR}/.bootstrap"
+KERNEL_TEST_REF="${KVM_AAVM_KERNEL_TEST_REF:-v7.2.2}"
 
 if [[ "$({ . /etc/os-release; printf '%s' "${ID}:${VERSION_ID}"; })" != "ubuntu:24.04" ]]; then
   echo "This bundle must be prepared on Ubuntu 24.04." >&2
@@ -25,7 +26,7 @@ packages=(
   libvirt-daemon-system libvirt-clients virt-manager virtinst
   gir1.2-spiceclientglib-2.0 gir1.2-spiceclientgtk-3.0
   libxml2-utils ovmf
-  swtpm swtpm-tools bridge-utils cpu-checker dnsmasq-base
+  swtpm swtpm-tools libtpms0 bridge-utils cpu-checker dnsmasq-base
   pciutils usbutils dmidecode acpica-tools python3-virt-firmware
   git ca-certificates curl wget dkms mokutil shim-signed openssl
   linux-headers-generic
@@ -36,13 +37,14 @@ packages=(
   libsdl2-image-dev zlib1g-dev libbz2-dev libcap-ng-dev libaio-dev
   libslirp-dev liburing-dev libepoxy-dev libdrm-dev libgbm-dev
   libgtk-3-dev libncurses-dev libssl-dev libelf-dev bc cpio fakeroot
-  devscripts debhelper rsync kmod initramfs-tools grub2-common
+  devscripts debhelper dh-exec libtool gawk rsync kmod initramfs-tools grub2-common
 )
 
 printf '%s\n' "${packages[@]}" > "$OFFLINE_DIR/roots.txt"
 mkdir -p "$DEB_DIR" "$SOURCE_DIR" "$BOOTSTRAP_DIR"
 python3 "$SCRIPT_DIR/resolve_debs.py" "$DEB_DIR" "${packages[@]}"
 python3 "$SCRIPT_DIR/download_optional_nvidia_dkms.py" "$DEB_DIR"
+python3 "$SCRIPT_DIR/prune_superseded_debs.py" "$DEB_DIR"
 python3 "$SCRIPT_DIR/generate_deb_index.py" "$DEB_DIR"
 
 if command -v git >/dev/null 2>&1; then
@@ -56,20 +58,56 @@ else
   GIT_ENV=(env "GIT_EXEC_PATH=$BOOTSTRAP_DIR/usr/lib/git-core")
 fi
 
-clone_clean() {
-  local path="$1"
-  shift
-  if [[ -e "$path" ]]; then
-    echo "Refusing to overwrite existing source: $path" >&2
-    exit 1
-  fi
-  "${GIT_ENV[@]}" "$GIT_BIN" clone "$@" "$path"
+git_run() {
+  "${GIT_ENV[@]}" "$GIT_BIN" "$@"
 }
 
-clone_clean "$SOURCE_DIR/qemu" --depth 1 --single-branch --branch stable-11.0 https://github.com/qemu/qemu.git
-clone_clean "$SOURCE_DIR/edk2" --depth 1 --recursive --shallow-submodules --single-branch --branch edk2-stable202602 https://github.com/tianocore/edk2.git
-clone_clean "$SOURCE_DIR/linux-tkg" --depth 1 https://github.com/Frogging-Family/linux-tkg.git
-clone_clean "$SOURCE_DIR/linux" --depth 1 --single-branch --branch v6.19 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+clone_or_reuse() {
+  local path="$1"
+  local remote="$2"
+  local ref="$3"
+  shift 3
+  if [[ -e "$path" ]]; then
+    if ! git_run -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "Existing source is not a Git worktree: $path" >&2
+      exit 1
+    fi
+    if [[ "$(git_run -C "$path" remote get-url origin)" != "$remote" ]]; then
+      echo "Existing source has an unexpected origin: $path" >&2
+      exit 1
+    fi
+    if [[ -n "$(git_run -C "$path" status --porcelain)" ]]; then
+      echo "Existing source has uncommitted changes: $path" >&2
+      exit 1
+    fi
+    if [[ -n "$ref" ]] && ! git_run -C "$path" merge-base --is-ancestor "$ref" HEAD; then
+      echo "Existing source does not contain required ref '$ref': $path" >&2
+      exit 1
+    fi
+    echo "Reusing verified source: $path"
+    return
+  fi
+  git_run clone "$@" "$remote" "$path"
+}
+
+clone_or_reuse "$SOURCE_DIR/qemu" https://github.com/qemu/qemu.git stable-11.0 --depth 1 --single-branch --branch stable-11.0
+clone_or_reuse "$SOURCE_DIR/edk2" https://github.com/tianocore/edk2.git edk2-stable202602 --depth 1 --recursive --shallow-submodules --single-branch --branch edk2-stable202602
+clone_or_reuse "$SOURCE_DIR/linux-tkg" https://github.com/Frogging-Family/linux-tkg.git "" --depth 1
+clone_or_reuse "$SOURCE_DIR/linux" https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git v6.19 --depth 1 --single-branch --branch v6.19
+
+if [[ -e "$SOURCE_DIR/linux-7.2" ]]; then
+  if [[ "$(sed -n -E 's/^VERSION[[:space:]]*=[[:space:]]*//p' "$SOURCE_DIR/linux-7.2/Makefile" 2>/dev/null)" != "7" \
+      || "$(sed -n -E 's/^PATCHLEVEL[[:space:]]*=[[:space:]]*//p' "$SOURCE_DIR/linux-7.2/Makefile" 2>/dev/null)" != "2" \
+      || "$(sed -n -E 's/^SUBLEVEL[[:space:]]*=[[:space:]]*//p' "$SOURCE_DIR/linux-7.2/Makefile" 2>/dev/null)" != "2" \
+      || -n "$(sed -n -E 's/^EXTRAVERSION[[:space:]]*=[[:space:]]*//p' "$SOURCE_DIR/linux-7.2/Makefile" 2>/dev/null)" ]]; then
+    echo "Existing Linux 7.2 source is not v7.2.2: $SOURCE_DIR/linux-7.2" >&2
+    exit 1
+  fi
+  echo "Reusing verified content-only source: $SOURCE_DIR/linux-7.2"
+else
+  clone_or_reuse "$SOURCE_DIR/linux-7.2" https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git "$KERNEL_TEST_REF" --depth 1 --single-branch --branch "$KERNEL_TEST_REF"
+fi
+clone_or_reuse "$SOURCE_DIR/libtpms" https://github.com/stefanberger/libtpms.git v0.9.3 --depth 1 --single-branch --branch v0.9.3
 
 curl --fail --location --output "$OFFLINE_DIR/memflow-source-only.dkms.tar.gz" \
   https://github.com/memflow/memflow-kvm/releases/download/bin-kernel-6.19/memflow-source-only.dkms.tar.gz

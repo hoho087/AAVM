@@ -23,6 +23,7 @@ OVMF 與 SSDT；此時固定保留 VNC/VGA 且不啟用任何硬體直通。VM �
 
 ```bash
 cd KVM-AntiAntiVM
+sudo apt-get update
 ./tools/prepare_offline.sh
 ./deploy.sh validate-offline
 ```
@@ -33,7 +34,9 @@ cd KVM-AntiAntiVM
 內實際偵測到 Windows ISO 時提供預設值。GPU 驅動則由 guest 的 Windows Update
 自動安裝，或由使用者在通用 GPU 驅動維護階段自行安裝。
 完成後複製**整個專案目錄**到離線主機。`offline/` 會包含 DEB、QEMU、EDK2、
-linux-tkg、Linux 6.19、memflow archive 和 SHA-256 manifest。部署器不會偷偷連網補檔。
+linux-tkg、Linux 6.19、`libtpms` 0.9.3 source、AMD fTPM profile patch、memflow archive
+和 SHA-256 manifest。部署器不會偷偷連網補檔；`install-offline` 在本機從這份固定 source
+建置並安裝 AMD profile 的 `libtpms0`，不使用網路或未受控 binary。
 
 ## 2. 從乾淨 Ubuntu 部署
 
@@ -52,7 +55,7 @@ sudo reboot
 ### 更新保護
 
 主選單第 8 項「更新保護」使用 `apt-mark hold` 鎖定目前已安裝的 Ubuntu 核心、
-headers/modules、QEMU/libvirt、OVMF、virt-manager/virtinst、swtpm 與 GPU 驅動套件，
+headers/modules、QEMU/libvirt、OVMF、virt-manager/virtinst、swtpm/libtpms 與 GPU 驅動套件，
 避免一般 `apt upgrade` 或 unattended upgrades 改變已驗證的直通堆疊。其他 Ubuntu
 安全更新不受影響。重跑啟用會補鎖後來新增的相關套件；停用只解除部署器自己建立的
 hold，不會移除使用者原本的 hold。若要刻意升級核心或虛擬化套件，先由此停用，完成
@@ -141,7 +144,14 @@ audio/USB functions，每項均需確認。首次套用預設進入通用 GPU �
 並以實體 GPU 為主要畫面。VM 啟動時 hook 會停止 display manager、detach 顯卡，
 VM 關機或 force-off 時 reattach 顯卡並恢復 Ubuntu 畫面。建議事先準備 SSH。
 新版 hook 若無法完整卸載顯示驅動，會中止 VM 啟動並立即恢復主機畫面；它不會在
-libvirt hook 內回呼 `virsh`。
+libvirt hook 內回呼 `virsh`。精靈還會在關閉畫面前驗證 GPU 的 IOMMU group：
+缺少 group，或 group 內還有未選的 PCI function，都會先拒絕直通，避免 QEMU
+在主機畫面關閉後才因 group 不完整而退出。
+
+從關閉顯示輸出開始，hook 使用交易式 rollback；display manager、seat 終止、
+驅動卸載、PCI unbind、VFIO bind 與選用 bus reset 都有有界等待。任一步逾時或
+失敗會觸發 EXIT trap，清除 `driver_override`、重新 probe 原驅動並啟動畫面，
+避免 hook 無限卡住而留下長時間黑屏。
 
 單 GPU 的顯示 function 預設生成 `<rom bar="off"/>`，等同取消 virt-manager 裡的
 「ROM BAR」勾選；libvirt 會將它轉成 QEMU `rombar=0`。部分高階 NVIDIA 顯卡若保留
@@ -191,6 +201,15 @@ VM 第 3 步「一鍵直通」可分別多選：
 sudo ./deploy.sh configure-passthrough --vm VM名稱
 ```
 
+若直通後 VM 無畫面或需要回到虛擬顯示器排查，先讓 VM 完全關機，再從
+「維護與進階工具 → 移除 VM 直通並恢復 VNC/VGA 排查模式」執行。此操作會移除
+部署器管理的 PCI/USB/GPU/網路直通、恢復 VNC/VGA、PS/2 輸入與 libvirt 虛擬網路，
+並保留 VM 磁碟、XML 身分、Guest VT-d、DMA 保護與 Secure Boot 設定。命令列等價操作：
+
+```bash
+sudo ./deploy.sh disable-passthrough --vm VM名稱
+```
+
 更新前會備份 inactive XML，只替換本部署器管理的 `ua-kvm-aavm-*` hostdev；其他手動
 加入的 hostdev 會保留。USB 一般使用 VID/PID 綁定；偵測到多個相同 VID/PID 時才加上
 Bus/Device 以避免選錯，但重新插拔後若位置改變，需重新執行此選項。
@@ -207,6 +226,26 @@ sudo ./deploy.sh adopt-vm --vm VM名稱
 - `set-dynamic --enable`：每次 VM 關機後排程上述 XML 隨機化；主機意外斷電時由開機
   service 補做 pending generation。
 - `randomize-all`：更新 XML，並從固定離線原始碼重新建置該 VM 專屬 QEMU/OVMF。
+
+若 VM 使用 persistent `swtpm`，上述 XML 身分刷新會在 UUID 變更時同步搬移
+`/var/lib/libvirt/swtpm/<UUID>` state，因此不會靜默製造新的 TPM identity；只有
+`recreate-tpm --vm VM名稱 --confirm` 會明確更換 TPM state。
+
+「維護與進階工具 → 重建目前 VM 的 QEMU／OVMF 工件」及
+`rebuild-artifacts --vm VM名稱` 只重建 patched QEMU/OVMF/SSDT，保留目前 XML 身份、
+Windows Boot Manager、NVRAM、PCI/USB/GPU 直通設定。部署器更新 QEMU/OVMF patch 後，
+已完成的 VM 應優先使用此項目套用新工件。
+
+目前版本也會在 QEMU 建置時停用 KVM 的跨 vendor `VMCALL/VMMCALL` 改寫 quirk，
+避免 VMAware 的「KVM interception」誤判。更新部署器後，既有 VM 必須完整關機並重建工件：
+
+```bash
+sudo ./deploy.sh rebuild-artifacts --vm VM名稱
+```
+
+若主機目前啟動的是部署器的 Linux 7.2.2 測試核心，還要在「自訂核心」精靈選擇
+Linux 7.2.2 重新建置並重新開機；核心補丁會把 AMD `SVM_EXIT_VMMCALL`／Intel
+`EXIT_REASON_VMCALL` 導向 guest `#UD`。只重建 QEMU 工件不會改變已安裝核心的 exit handler。
 
 每次操作會先把 inactive XML 存到 `/var/lib/kvm-aavm/backups/VM名稱/`。大量硬體
 身分變更可能觸發 Windows 啟用、驅動或 BitLocker 復原要求。
@@ -228,7 +267,8 @@ split IOAPIC 與 KVM hidden；只有明確啟用進階 guest VT-d 選項時才�
 
 `model="intel"` 是 Q35 guest 的虛擬 IOMMU 型號，AMD host 也使用它。主機端則依 CPU
 自動使用 `intel_iommu=on` 或 `amd_iommu=on`。BIOS 的 VT-d/AMD-Vi/IOMMU 必須由使用者
-自行開啟。主機 KVM 模組預先準備 `nested=1`，但每台 VM 預設仍會以
+自行開啟。AMD 主機 KVM 模組會明確設定 `nested=1 avic=1`；Intel 設定 `nested=1`。
+每台 VM 預設仍會以
 `<feature policy="disable" name="svm|vmx"/>` 隱藏 CPU 虛擬化功能；只有明確啟用
 「核心隔離／VBS」的 VM 才改為 `policy="require"`。主機 IOMMU/VFIO、guest 虛擬
 IOMMU 與 guest SVM/VMX 是獨立開關：關閉 guest VT-d 不會影響 PCI/USB/GPU
@@ -266,12 +306,71 @@ guest，避免部分顯卡出現無訊號；建立精靈與直通管理選單仍
 一次，避免顯卡 warm reset 失敗。
 
 Guest Secure Boot 使用每台 VM 持久保存的
-`firmware/OVMF_VARS_4M.ubuntu-install.qcow2`。啟用時部署器會先備份 VARS，再以
-`virt-fw-vars` 原子合併 `PK`、`KEK`、`db`、`dbx` 並設定 `SecureBootEnable`；不會匯入
-模板的 `BootOrder` 或 `Boot####`，因此 Windows Boot Manager 不會被覆蓋。優先沿用該次
-OVMF patch 從實體主機取得的安全開機金鑰，缺少時才使用 Ubuntu OVMF 的 Microsoft
-enrolled 模板。這裡是 guest 韌體狀態，與 Ubuntu 主機用於 DKMS/linux-tkg 的 MOK 是
-兩套不同機制。
+`firmware/OVMF_VARS_4M.ubuntu-install.qcow2`。啟用時部署器會先備份 VARS，再從主機
+UEFI `efivarfs` 讀取目前 active `PK`、`KEK`、`db`、`dbx`，並同時保存
+`PKDefault`、`KEKDefault`、`dbDefault`、`dbxDefault` 作為該主機板的 factory-reset state；
+快照儲存於 `/var/lib/kvm-aavm/secure-boot/host-active-microsoft.json`，權限為 root-only。
+
+Guest 的 active `PK`、`KEK`、`db`、`dbx` 會逐一鏡像主機目前實際使用的 database，包含已套用
+的 Microsoft trust 與 dbx revocation 更新；`*Default` 家族保留主機板 factory values。部署器會先
+驗證 active `KEK` 與 `db` 已含 Microsoft 憑證，否則 fail closed。這會完整覆寫先前自行加入的
+**Custom keys**，設定 `CustomMode=false`、`VendorKeysNv=true` 及 `SecureBootEnable=true`，但不會
+混入 Ubuntu OVMF 自有金鑰。
+
+啟用 Secure Boot 時，部署器會同時記錄供應 active key set 的主機 BIOS vendor/version/date
+與主機板名稱，並把同一組資料寫入 guest 韌體的 SMBIOS Type 0 與 HSTI platform descriptor。
+後續 QEMU/OVMF artifact 重建會重用這份固定資料，不會再生成互相矛盾的隨機 BIOS 版本或日期；
+既有 VM 需在關機時執行「重建目前 VM 的 QEMU／OVMF 工件」才會套用新的 CODE image。
+
+它不會匯入或變更 `BootOrder`、`Boot####`、Windows Boot Manager 或 shim 的 MOK variables。
+主機並非 UEFI 開機、或缺少任何 factory variable 時，操作會 fail closed 並且不修改 VM VARS。
+這裡是 guest 韌體狀態，與 Ubuntu 主機用於 DKMS/linux-tkg 的 MOK 是兩套不同機制。
+
+若要先檢查或保存部署器將使用的 active/factory key databases，可執行：
+
+```bash
+sudo ./deploy.sh export-host-secure-boot --output /root/kvm-aavm-host-secure-boot.json
+```
+
+輸出包含 active `PK/KEK/db/dbx` 與其 `*Default` factory-reset databases、UEFI attributes，
+不包含 Windows 開機項目或 MOK variables。檔案權限為 `0600`；啟用 guest Secure Boot 時，
+部署器會重新讀取主機 variables 並建立新的可稽核快照。
+
+### TPM 裝置
+
+「維護與進階工具 → vTPM 管理」可在 VM 完全關機時選擇 AMD-profiled software TPM 2.0 profile、
+一般持久 `swtpm` TPM 2.0，或移除 TPM。AMD profile 只在 AMD host profile 上提供，必須已由
+`install-offline` 安裝本專案 source-pinned、版本標記為 `+kvm-aavm1` 的 patched `libtpms0`；
+否則部署器會拒絕套用，絕不回退成一般 library。它固定使用 `tpm-crb` 與 TPM 2.0，並回報
+AMD/fTPM fixed capability profile。部署流程會讀取主機 `/sys/class/tpm/tpm0/pcr-*` 的實際啟用
+PCR bank，讓 `swtpm_setup` 使用同一組；主機沒有可讀取的 TPM 時才使用 `sha1,sha256` fallback。
+EK/platform certificate metadata 會設為 `AMD / fTPM / 2.0`；這些設定只會套用到新製造或重新
+製造的 TPM state，既有 state 不會由部署器靜默覆寫。
+
+此 profile 不會使用、鎖定或改變主機的 fTPM/Intel PTT；其 state 仍由 libvirt 為該 VM 持久保存。
+
+patched OVMF 以 `TPM2_ENABLE` 建置，發布 artifact 前會驗證 `Tcg2Pei`、`Tcg2Dxe`、
+`Tcg2PlatformPei/Dxe` 都存在於實際 DSC/FDF build graph。這些模組會量測 firmware volume、
+UEFI image 與後續 boot events，並建立供 Windows 讀取的 TCG2 event log；PCR 值必須由這份
+event log 重播得到，部署器不會寫死或複製主機 PCR。既有 swtpm identity 不會因更新 OVMF
+靜默重製；是否需要重製應以 guest 的 event-log/PCR replay 結果決定。
+
+這仍然是軟體 TPM，沒有 AMD 真實 fTPM 的硬體 EK 私鑰、平台 seed、廠商 EK 憑證鏈或硬體防回放
+計數器；因此不能當成實體 TPM 的遠端證明來源。實體 TPM 的 PCR 是 Ubuntu 主機的量測開機鏈，無法代表 Windows 客體的 UEFI、boot loader 與
+驅動程式。為避免安全狀態與量測記錄互相矛盾，部署器不提供實體 TPM 直通。既有實體 TPM
+直通 VM 應在完全關機後切換為 vTPM 或移除 TPM；更換 TPM 身分可能要求 BitLocker 復原金鑰。
+
+若要明確重製某台 VM 的 TPM 身分，必須先完整關機，使用：
+
+```bash
+sudo ./deploy.sh recreate-tpm --vm VM名稱 --confirm
+```
+
+部署器會先把 TPM state 複製到 `/var/lib/kvm-aavm/backups/VM名稱/tpm-state-*`，再將原 state
+改名保留為 `*.kvm-aavm-retired-*`，下次啟動才由 libvirt 製造新 state。此命令不會修改
+Secure Boot VARS、Windows 磁碟或 XML，但 TPM EK、PCR 與所有 TPM-bound secrets 都會改變；
+BitLocker、Windows Hello、Device Encryption 可能要求復原或重新註冊。沒有 `--confirm` 時命令
+會拒絕執行。維護選單的「vTPM 管理」也提供相同的二次確認入口。
 
 ### Windows 核心隔離／記憶體完整性（VBS/HVCI）
 
@@ -282,6 +381,10 @@ VM 第 2 步與維護選單都提供每台 VM 的 VBS 開關，預設關閉。�
   會寫入持久設定、更新 initramfs 並要求重開 Ubuntu，不會自動啟動 VM。
 - 對 AMD guest 加入 `<feature policy="require" name="svm"/>`，Intel 則使用 `vmx`；
   `hypervisor` CPUID bit 與 KVM hidden 繼續維持原設定。
+- 可選擇 nested Hyper-V 效能加速，啟用 `direct stimer`、`hv-tlbflush`、`ipi` 等標準
+  enlightenment。AMD AVIC 只依主機 `kvm_amd avic` 能力獨立啟用；GMET 與 extended/direct
+  TLB flush 仍要求完整 `nested`、`npt`、`avic`、`gmet` 能力。缺少 GMET 不會再把可用的
+  AVIC 一起關掉。
 - 保留 Secure Boot、guest VT-d、核心 DMA 保護、PCI/USB/GPU 直通及虛擬網卡選擇。
 
 進入 Windows 後再到「Windows 安全性 → 裝置安全性 → 核心隔離詳細資料」開啟
@@ -290,18 +393,105 @@ VM 第 2 步與維護選單都提供每台 VM 的 VBS 開關，預設關閉。�
 VMAware 2.8.1 增加一項 `timing anomaly`，雖然仍為 `VM confirmation: false` 且結論是
 bare metal，但需要完全 0 偵測時應保持關閉。
 
-目前驗證的 Ryzen 主機原始 CPUID `0x8000000A.EDX[17]` 實際為 1（硬體支援
-GMET），但離線 Linux 6.19 的 KVM SVM 並未定義或加入 `X86_FEATURE_GMET`
-到 nested guest capability，因此 QEMU host model 仍回報 `gmet=false`。QEMU 認得
-`gmet` 這個 CPU 功能名稱不等於 KVM 已實作它；部署器不會只偽造 CPUID 來強制
-開啟。後續若導入完整的 KVM nested-GMET 支援，必須另行驗證 Windows Hyper-V/HVCI
-的實際執行語義與回歸測試，不只是 XML 啟用測試。
+Linux 7.2 已包含 KVM AMD GMET 與 nested-SVM 支援。部署器在每次套用安全設定時重新
+讀取目前載入的 KVM 模組參數，因此只會在實際可用的核心啟用上述 AMD 擴充；舊核心或
+Intel 主機仍可使用標準 nested Hyper-V enlightenment。這些選項降低巢狀 Hyper-V/HVCI
+的正確性與效能成本，並不會偽造計時結果或保證移除 `timing anomaly` 偵測。
+
+Linux 7.2 AMD 測試核心在 Windows/Hyper-V 寫入 `EFER.SVME` 後，會清除 VMCB01 的
+`INTERCEPT_CPUID`；韌體與一般 Windows 開機階段仍使用 KVM CPUID 模型。Nested VMCB02
+保留 L0/L1 的 intercept 合併，不能依 VMRUN 時快照的 CPL 清除 CPUID，否則會繞過 L1
+並可能讓 Windows Hyper-V 停滯。修改需重新建置、安裝並開機進入 Linux 7.2 patched AMD
+核心後才會生效；是否消除 VMAware 計時異常必須以重新量測結果為準。
+
+為了降低仍無法避免的 nested leaf 0 VMEXIT 軟體成本，7.2 實驗補丁會在
+`KVM_SET_CPUID2` 後預先快取 guest-visible leaf 0，並在 SVM IRQ-off VMEXIT 路徑直接寫回
+EAX/EBX/ECX/EDX、推進 RIP 後立即重入 L2。此路徑不會清除 VMCB02，只限 leaf 0；
+CPUID faulting、mediated PMU、SEV-ES、沒有 NRIPS 或其他 leaf 都回到原本的 nested/
+CPUID handler。
+重複 leaf 0 命中時，會在和 x86 core 相同的 vCPU mode、KVM request 與 thread-work
+檢查後留在 `svm_vcpu_run()` 內，略過沒有變化的 ASID、CR2/CR8、VP-ID、DR6 與
+nested-RIP entry preparation。v4 在完整回存 RAX/RSP/RIP、CR2/CR0/CR3、
+dirty-register 狀態、DEBUGCTL 並執行 STGI 後，才允許延後空的 event completion
+與 nested-control tail。只有在無 pending event/request、無 mediated PMU 指令計數、
+TLB/ERAP 已乾淨、nested vTPR 啟用且 PMU global MSR 仍由 KVM intercept 時才會命中；
+其他情況全部回完整上游 exit tail。
+v3 另在 TF/KVM single-step 關閉且 PMU guard 通過時直接提交 NRIPS 與清除 interrupt
+shadow，省去通用 instruction-retire/skip 尾端。對上游新版 VMAware 的 `#DB` 計時，只有
+VMCB12 明確擁有 `#DB`，且 L0 沒有 debugger、hardware breakpoint、NMI single-step、
+event reinjection 或 pending exception 責任時，才在同一輪同步 DR6/DR7 並反射給 L1；其他
+狀態完全沿用原本 queued exception 路徑。
+
+v5 曾針對舊版 `Memory > VMM` 加入四槽 nested NPF PTE-value cache。完整 profiler
+確認 GPA `0x3000` 命中 499 次，但完整返回延遲桶完全不變；其餘 5,494 個 NPF 反而
+都多付出 128–512 ns 為主的查找成本。因此 v6 已撤除此快取並恢復原始 KVM MMU
+fault 分類路徑。VMCB12 writable map reuse 則保留：它把主要 `nested_svm_vmexit`
+延遲桶由 2–4 us 降至 1–2 us。map 仍只從一次 VMRUN 保留到對應 nested VMEXIT；
+GPA 或 memslot generation 改變時會先 unmap 再重建。這不會直接反射尚未分類的
+hardware NPF，也不改 VMCB02 的 NPF ownership。
+
+進入 7.2 核心後，先執行唯讀 provenance 檢查，確認載入的模組和 source 不是舊版本：
+
+```bash
+sudo python3 verification/verify_live_cpuid_policy.py
+```
+
+此檢查會驗證執行中的 `7.2.2-tkg-eevdf`、`kvm_amd` vermagic、loaded module
+與 7.2 build tree module 的 GNU build ID、SVME gate、只限 leaf 0 的 L2→L0 fallback、
+IRQ-off fastpath 與 event-safe deferred-tail guards、VMCB02 未被直接清除，以及 `win11`
+的狀態；也會要求 `nested_npf_value_cache=absent` 與
+`vmcb12_map_reuse=present`。`srcversion` 不能單獨證明補丁已載入，因為只修改模組
+內部程式碼時它可能保持不變。
+
+AMD SVM 的 CPUID intercept 是全域 bit，沒有 CPUID leaf bitmap。先在沒有
+profiler 運作時執行 VMAware TIMER 並記錄 ratio，再另外執行一次下列診斷：
+
+```bash
+sudo verification/nested-cpuid-static-fastpath-20260830/VMEXIT_PROFILE.sh \
+  start verification/timer-window.txt
+# 只重複 TIMER workload 來判斷 CPUID ownership；這次的 ratio 不得當效能結果
+sudo verification/nested-cpuid-static-fastpath-20260830/VMEXIT_PROFILE.sh stop
+```
+
+預設會使用過濾後的 CPUID-only 模式，但 tracepoint 本身仍會改變 VMEXIT 延遲，
+所以不能將 profiler 開啟時的 TIMER ratio 用來做 A/B 比較。停止後報告會附上
+`cpuid_path_analysis`。`kvm_nested_vmexit` 發生在 KVM 決定由 L0 處理或轉交 L1
+之前，因此它的數量本身不能證明 L1 ownership。新版 profiler 會把 nested CPUID
+事件與下一次 `kvm_entry` 前的 `kvm_cpuid` 配對；只有
+`cpuid_l2_l0_emulations` 能證明 L2 CPUID 到達 L0 cached handler（包含 IRQ-off
+immediate-reentry fastpath）。新版也會先比對 loaded module build ID 與 DWARF
+image，再用唯讀 kprobe 將 generic path 的 CPUID leaf 列為
+`nested_observed_top`；只有 `cpuid_leaf_probe=enabled` 時才能採信這些 leaf counts。
+直接清除 VMCB02
+仍會破壞 Hyper-V 對其他 leaf 的 ownership，不是安全方案。
+
+舊版 VMAware 顯示的 `Memory > VMM` 並不是一般 RAM latency。它透過 WHP 建立 nested
+vCPU，刻意讀未映射 GPA `0x3000`，計時完整 nested NPF 返回，並以 2256 次
+`NtQuerySystemTime` 作分母，門檻為 4.0。上游在 2026-08-22 的 `01b0174` 移除此 WHP
+測試，最新版改用硬體 `#DB` 與 `NtRaiseException` 比較，門檻為 2.5。要歸因兩代路徑，
+先讓 `win11` 開機並穩定，再開一個獨立的 full 診斷視窗：
+
+```bash
+sudo verification/nested-cpuid-static-fastpath-20260830/VMEXIT_PROFILE.sh \
+  start verification/nested-timer-window.txt full
+# 只執行 TIMER，完成後立刻停止
+sudo verification/nested-cpuid-static-fastpath-20260830/VMEXIT_PROFILE.sh stop
+```
+
+報告會列出 NPF (`1024`) 與 `#DB` (`65`) 的實際
+`kvm_nested_vmexit_inject` 數量、fault GPA，以及 VMEXIT 到下一次 VM entry 的延遲
+histogram。full 模式另外將 L1-owned NPF 拆成 `npf_handler_ns`、
+`npf_exit_to_l1_confirmed_ns`、`nested_vmexit_ns`、`vmcb12_map_ns`、
+`vmcb12_mapped_write_ns` 與 `vmcb12_reused_write_ns`，用來確認原始 MMU 分類路徑與
+VMRUN map reuse 是否實際命中。v6 不再探測已移除的 NPF value-cache symbol。
+啟用 profiler 時的 ratio 仍不得當成效能 A/B 結果。
 
 命令列等價選項：
 
 ```bash
 sudo ./deploy.sh configure-guest-security --vm VM名稱 --core-isolation
 sudo ./deploy.sh configure-guest-security --vm VM名稱 --no-core-isolation
+sudo ./deploy.sh configure-guest-security --vm VM名稱 --core-isolation --hyperv-enlightenments
 ```
 
 Windows PE 安裝階段暫不加入 guest IOMMU 與 split IOAPIC，使用 Ubuntu QEMU 的標準
@@ -314,6 +504,25 @@ PCI/USB passthrough 不受此選項影響。
 切到隨機化 patched OVMF。完整隨機化會重建 patched CODE，但不覆蓋正在使用的 VARS。
 部署器啟動安裝器後會在 OVMF 的短暫 DVD 開機時窗內重試送出空白鍵，以適應不同速度
 的 CPU、儲存裝置與主機，不必先開啟圖形控制台搶按按鍵。
+
+### 2 MiB Hugepages
+
+「維護與進階工具 → CPU SMT 拓撲／綁核／2 MiB Hugepages／主機電源效能模式」可針對每台
+部署器建立的 VM 開關 2 MiB hugepages，預設關閉。啟用時 VM 必須完全關機；部署器依其
+RAM 大小預留 `記憶體 GiB × 512` 個頁面，並將所有已啟用 VM 的需求相加，寫入唯一受管理的
+`/etc/sysctl.d/99-kvm-aavm-hugepages.conf`。XML 會使用 `<memoryBacking><hugepages>`
+及 `<nosharepages/>`，不會啟用 1 GiB hugepages 或不必要的 memlock 限制。
+
+若核心無法立即配置所需頁面，部署器不會修改 VM XML，會恢復先前的 reservation 與 sysctl
+檔案；先關閉吃記憶體的程式或降低 VM RAM 後再試。關閉最後一台使用 hugepages 的 VM 設定時，
+部署器會將預留歸零並移除自己的 sysctl 檔案。
+
+命令列等價選項：
+
+```bash
+sudo ./deploy.sh configure-performance --vm VM名稱 --vcpus 12 --hugepages
+sudo ./deploy.sh configure-performance --vm VM名稱 --vcpus 12 --no-hugepages
+```
 
 ## 7. 精簡 QEMU 虛擬設備
 
@@ -370,6 +579,21 @@ Ubuntu 核心只有在這張 Machine Owner Key 已登錄後才允許載入。部
 2. 選 `Continue` → `Yes`。
 3. 輸入安裝時設定的一次性 MOK 密碼。
 4. 選擇重新開機，回到 Ubuntu 後再執行「安裝 memflow」確認能直接載入。
+
+### 8.1 Linux 7.2.2 實驗核心
+
+自訂核心精靈的第 3 項是獨立的 `Linux 7.2.2` 實驗 profile，目的是在不覆蓋
+6.19 穩定核心的前提下測試 HVCI/VBS 的 KVM 效能。它只接受本地、固定版本的
+`v7.2.2` source，並要求 CPU 對應的 `amd72-test.mypatch` 或 `intel72-test.mypatch`；
+6.19 補丁不會被自動重用，避免在 KVM 結構變動後產生可開機但行為錯誤的核心。
+
+若部署包尚未包含 Linux 7.2.2，準備新的離線包時，
+`tools/prepare_offline.sh` 會另外固定抓取 `v7.2.2` 到 `offline/sources/linux-7.2`；
+目前部署器 profile 固定為 7.2.2；其他 point release 必須先有相容的 CPU 補丁並同步更新 profile，
+不會只靠環境變數繞過版本檢查。
+部署端不會下載或回退到其他版本，缺少 source／port 補丁時會在編譯前停止。
+實驗核心安裝完成後仍保留 Ubuntu generic 與 6.19 TKG 核心，請先在 GRUB 選單測試，
+確認 HVCI/VBS、VFIO、NVIDIA/DKMS 和 Secure Boot 後再決定是否使用。
 
 ## 9. QEMU-full-emulation 交叉審查
 

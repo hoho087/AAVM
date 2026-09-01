@@ -24,6 +24,119 @@ sudo ./deploy.sh devirtualize-vm --vm VM名稱
 sudo ./deploy.sh one-click-passthrough --vm VM名稱
 ```
 
+For AMD systems, `維護與進階工具 -> vTPM 管理` can enable the source-pinned
+AMD-profiled software TPM 2.0 profile. The same menu also manages persistent
+guest Secure Boot: it restores the host motherboard factory databases, verifies
+their shipped Microsoft keys, and replaces guest `PK/KEK/db/dbx` so custom
+firmware keys and OVMF-owned keys are removed.
+The OVMF build also aligns BIOS vendor/version/date and its HSTI platform
+descriptor with that physical motherboard; rebuild existing VM artifacts after
+updating to apply CODE-image changes.
+See [`DEPLOYMENT.zh-TW.md`](DEPLOYMENT.zh-TW.md) for the key-policy and BitLocker implications.
+
+The AMD profile uses persistent `swtpm/libtpms` TPM 2.0 behind `tpm-crb`, while
+patched OVMF includes the TCG2 PEI/DXE measured-boot modules that extend PCRs and
+publish the EFI event log. XML identity refreshes migrate the UUID-keyed swtpm
+state, so they do not silently change the TPM identity; `recreate-tpm --confirm`
+retires the previous state and creates a fresh TPM identity on the next boot
+without starting the VM.
+It cannot
+contain AMD's hardware-backed endorsement key, platform seed, or factory certificate
+chain. It aligns the observable manufacturer/capability profile, PCR banks, and
+certificate metadata, but it is not a physical fTPM or a hardware attestation source.
+
+For the Linux 7.2 AMD test kernel, the CPUID policy keeps firmware and ordinary
+Windows boot under KVM interception, then clears only VMCB01's CPUID intercept
+after the guest enables `EFER.SVME`. Nested VMCB02 preserves the L0/L1 merged
+intercept contract. For the measured nested CPUID leaf 0 only, Linux 7.2 caches
+the guest-visible CPUID result at `KVM_SET_CPUID2` time and handles the common
+case in SVM's IRQ-off immediate-reentry path. After the standard mode/request/
+thread-work boundary, repeated leaf-0 exits can remain inside `svm_vcpu_run()`
+and skip invariant entry preparation. A stricter v4 guard can also defer the
+nested-control and empty event-completion tail, but only after all hardware
+register state and DEBUGCTL have been restored and `STGI` has run. Pending
+events/requests, PMU state, TLB/ERAP work, non-virtualized TPR, and every other
+exit use the complete upstream tail. The guarded leaf-0 path also commits NRIPS directly when TF and KVM
+single-step are inactive.  For current upstream VMAware, a separate guarded
+path reflects an L1-owned nested `#DB` in the same pass after synchronizing DR6;
+host debugging, hardware breakpoints, NMI single-step and event reinjection stay
+on the stock queued path. CPUID faulting, mediated PMU,
+SEV-ES, missing NRIPS, and every other leaf retain the normal slow/fallback
+path. For the legacy nested-NPF Memory check, v5 keeps a four-slot cache only
+for non-present faults already proven L1-owned by the stock KVM walker. A hit
+rereads and exactly compares the complete NPT PTE chain plus memslot generation;
+permission, reserved-bit, GMET-fetch, encrypted/RMP, changed-PTE, and read-error
+cases all return to the original MMU path. VMCB12's writable map is retained
+only from one VMRUN to its nested VMEXIT, and is remapped if the GPA or memslot
+generation changed. No VMCB02 NPF ownership bit is changed and no hardware NPF
+is reflected without prior software proof. Host setup persists
+`kvm_amd nested=1 avic=1`. Rebuild, install, and boot the patched kernel before
+these kernel-side changes become active.
+
+After booting the test kernel, run the read-only provenance check before starting
+`win11`:
+
+```bash
+sudo python3 verification/verify_live_cpuid_policy.py
+```
+
+This checks the running Linux 7.2.2 kernel, module vermagic, the loaded module's GNU
+build ID against the module produced by the 7.2 build tree, source markers, the
+bounded L2 leaf-0 route, cached IRQ-off fastpath, event-safe deferred-tail
+guards, value-validated nested-NPF cache, generation-checked VMCB12 map reuse,
+and the absence of rejected VMCB02/broad-leaf changes.
+`srcversion` alone is not sufficient proof that the patched module is loaded.
+
+AMD SVM exposes one global CPUID intercept bit, not a per-leaf bitmap. First run
+the VMAware TIMER test with no profiler active and record its ratios. Then use a
+separate diagnostic run to distinguish an L0-owned intercept from a CPUID exit
+that L1 Hyper-V explicitly requested in VMCB12:
+
+```bash
+sudo verification/nested-cpuid-static-fastpath-20260830/VMEXIT_PROFILE.sh \
+  start verification/timer-window.txt
+# Repeat the TIMER workload only to attribute CPUID ownership. Do not use the
+# ratios from this instrumented run as performance results.
+sudo verification/nested-cpuid-static-fastpath-20260830/VMEXIT_PROFILE.sh stop
+```
+
+The profiler defaults to a filtered CPUID-only mode, but tracepoint attachment
+still changes VMEXIT latency. The stop command appends `cpuid_path_analysis`.
+`kvm_nested_vmexit` is emitted before KVM decides whether an exit stays in L0
+or is forwarded to L1, so its count alone is not an ownership result. The
+profiler now correlates `kvm_cpuid` before the next `kvm_entry`; only
+`cpuid_l2_l0_emulations` proves that an L2 CPUID reached L0's cached handler,
+including the new immediate-reentry fastpath.  The profiler also verifies the
+loaded module's build ID against its DWARF image and reports generic-path CPUID
+leaves as `nested_observed_top`.  Use those leaf counts only when the report
+says `cpuid_leaf_probe=enabled`.
+Forcing VMCB02 clear remains unsafe because AMD provides one global CPUID
+intercept bit and Hyper-V relies on the other leaves.
+
+The older VMAware `Memory > VMM` check is not ordinary RAM latency: it creates
+a WHP vCPU, deliberately accesses unmapped GPA `0x3000`, and times the complete
+nested NPF return against 2256 `NtQuerySystemTime` calls (threshold 4.0). Upstream
+removed that WHP test in commit `01b0174` and now compares hardware `#DB` against
+`NtRaiseException` (threshold 2.5). To attribute both paths, boot and settle
+`win11`, then use a separate full diagnostic window:
+
+```bash
+sudo verification/nested-cpuid-static-fastpath-20260830/VMEXIT_PROFILE.sh \
+  start verification/nested-timer-window.txt full
+# Run only the TIMER workload, then stop immediately.
+sudo verification/nested-cpuid-static-fastpath-20260830/VMEXIT_PROFILE.sh stop
+```
+
+The report includes actual `kvm_nested_vmexit_inject` counts for NPF (`1024`)
+and `#DB` (`65`), fault GPAs, and exit-to-next-entry histograms. Full mode also
+breaks an L1-owned NPF into `npf_handler_ns`,
+`npf_exit_to_l1_confirmed_ns`, `nested_vmexit_ns`, `vmcb12_map_ns`, and
+`vmcb12_mapped_write_ns`. v6 also reports `vmcb12_reused_write_ns`, which
+confirms that nested VMEXIT reused the VMRUN mapping. The experimental v5 NPF
+value cache was removed after 499 hits left the GPA `0x3000` round trip
+unchanged while all 5,494 misses paid extra lookup cost. As with CPUID,
+instrumented ratios are not performance results.
+
 ---
 
 +----------+    +----------+    +------------+
@@ -536,6 +649,12 @@ pcibridge_8086="a0ef"   # Tiger Lake-LP Shared SRAM
 - Device Manager >> View >> Show hidden devices >> Intel(R) 82574L Gigabit Network Connection >> Uninstall device
 
 ### 5.3. Build custom Linux kernel (mandatory)
+
+For the supported Ubuntu offline workflow, use `sudo ./deploy.sh` and choose
+the custom-kernel menu. The stable path builds Linux 6.19; the separate
+`build-kernel-test` command targets a pinned Linux 7.2.2 source only when the
+offline bundle contains it and a separately ported CPU patch. The Fedora RPM
+commands below are legacy reference steps and are not used by the deployer.
 
 
   <details>

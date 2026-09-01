@@ -1,5 +1,6 @@
---- a/arch/x86/kvm/svm/svm.c	2026-04-22 12:30:53.000000000 +0100
-+++ b/arch/x86/kvm/svm/svm.c	2026-07-27 18:14:45.797696968 +0100
+diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
 @@ -217,8 +217,8 @@
  			svm_leave_nested(vcpu);
  			svm_set_gif(svm, true);
@@ -24,7 +25,26 @@
  
  	if (kvm_cpu_cap_has(X86_FEATURE_SHSTK)) {
  		bool shstk_enabled = guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK);
-@@ -1037,7 +1037,8 @@
+@@ -1011,6 +1011,18 @@
+ 			svm->vmcb->control.virt_ext |= VIRTUAL_VMLOAD_VMSAVE_ENABLE_MASK;
+ 		}
+ 	}
++
++	/*
++	 * KVM-AAVM: keep firmware and the ordinary Windows kernel on KVM's
++	 * architectural CPUID model.  Once an outer Hyper-V enables EFER.SVME,
++	 * let only VMCB01 execute native CPUID.  VMCB12/02 intercept ownership
++	 * remains merged by nested_vmcb02_recalc_intercepts().
++	 */
++	if (vcpu->arch.efer & EFER_SVME)
++		svm_clr_intercept(svm, INTERCEPT_CPUID);
++	else
++		svm_set_intercept(svm, INTERCEPT_CPUID);
++
+ }
+ 
+ static void svm_recalc_intercepts(struct kvm_vcpu *vcpu)
+@@ -1038,7 +1050,8 @@
  	set_dr_intercepts(svm);
  
  	set_exception_intercept(svm, PF_VECTOR);
@@ -34,7 +54,7 @@
  	set_exception_intercept(svm, MC_VECTOR);
  	set_exception_intercept(svm, AC_VECTOR);
  	set_exception_intercept(svm, DB_VECTOR);
-@@ -1047,7 +1048,7 @@
+@@ -1048,7 +1061,7 @@
  	 * We intercept those #GP and allow access to them anyway
  	 * as VMware does.
  	 */
@@ -43,17 +63,18 @@
  		set_exception_intercept(svm, GP_VECTOR);
  
  	svm_set_intercept(svm, INTERCEPT_INTR);
-@@ -1057,7 +1058,8 @@
+@@ -1058,8 +1071,9 @@
  		svm_set_intercept(svm, INTERCEPT_SMI);
  
  	svm_set_intercept(svm, INTERCEPT_SELECTIVE_CR0);
 -	svm_set_intercept(svm, INTERCEPT_RDPMC);
+ 	svm_set_intercept(svm, INTERCEPT_CPUID);
 +//	svm_set_intercept(svm, INTERCEPT_RDPMC);  // NIKA removed
 +	svm_clr_intercept(svm, INTERCEPT_RDPMC);  // NIKA added
- 	svm_set_intercept(svm, INTERCEPT_CPUID);
  	svm_set_intercept(svm, INTERCEPT_INVD);
  	svm_set_intercept(svm, INTERCEPT_INVLPG);
-@@ -1077,6 +1079,8 @@
+ 	svm_set_intercept(svm, INTERCEPT_INVLPGA);
+@@ -1078,6 +1092,8 @@
  	svm_set_intercept(svm, INTERCEPT_XSETBV);
  	svm_set_intercept(svm, INTERCEPT_RDPRU);
  	svm_set_intercept(svm, INTERCEPT_RSM);
@@ -62,37 +83,7 @@
  
  	if (!kvm_mwait_in_guest(vcpu->kvm)) {
  		svm_set_intercept(svm, INTERCEPT_MONITOR);
-@@ -1747,6 +1751,19 @@
- 		vcpu->arch.cpuid_dynamic_bits_dirty = true;
- }
- 
-+static void svm_set_cpuid_intercept_for_each_vcpu(struct kvm_vcpu *vcpu, bool b)  // NIKA begin
-+{
-+	unsigned long i;
-+	struct kvm_vcpu *tmp;
-+	u64 tsc = rdtsc();
-+	kvm_for_each_vcpu(i, tmp, vcpu->kvm) {
-+		tmp->last_exit_start = tsc;
-+		tmp->intercept_cpuid = b;
-+		tmp->infer_intercept = true;
-+		kvm_vcpu_kick(tmp);
-+	}
-+}  // NIKA end
-+
- static void svm_set_segment(struct kvm_vcpu *vcpu,
- 			    struct kvm_segment *var, int seg)
- {
-@@ -1775,6 +1792,9 @@
- 		/* This is symmetric with svm_get_segment() */
- 		svm->vmcb->save.cpl = (var->dpl & 3);
- 
-+	if (unlikely(vcpu->vcpu_id == 0 && var->base == 0xffff0000 && seg == VCPU_SREG_CS))  // VIRTFUNC added
-+		svm_set_cpuid_intercept_for_each_vcpu(vcpu, true);  // VIRTFUNC added
-+
- 	vmcb_mark_dirty(svm->vmcb, VMCB_SEG);
- }
- 
-@@ -2201,6 +2221,7 @@
+@@ -2201,6 +2217,7 @@
  	/* Both #GP cases have zero error_code */
  	if (error_code)
  		goto reinject;
@@ -100,7 +91,7 @@
  
  	/* Decode the instruction for usage later */
  	if (x86_decode_emulated_instruction(vcpu, 0, NULL, 0) != EMULATION_OK)
-@@ -2997,10 +3018,10 @@
+@@ -2995,10 +3012,10 @@
  		 * Suppress BTF as KVM doesn't virtualize BTF, but there's no
  		 * way to communicate lack of support to the guest.
  		 */
@@ -115,32 +106,7 @@
  
  		if (data & DEBUGCTL_RESERVED_BITS)
  			return 1;
-@@ -3158,6 +3179,14 @@
- 	return 0;
- }
- 
-+static int cpuid_interception(struct kvm_vcpu *vcpu)  // NIKA begin
-+{
-+//	if (rdtsc() - vcpu->last_exit_start > 290304000000)  // Intel® Core™ processors >120 seconds
-+	if (rdtsc() - vcpu->last_exit_start > 145152000000)  // Intel® Core™ processors >60 seconds
-+		svm_set_cpuid_intercept_for_each_vcpu(vcpu, false);
-+	return kvm_emulate_cpuid(vcpu);
-+}  // NIKA end
-+
- static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
- 	[SVM_EXIT_READ_CR0]			= cr_interception,
- 	[SVM_EXIT_READ_CR3]			= cr_interception,
-@@ -3196,7 +3225,8 @@
- 	[SVM_EXIT_SMI]				= smi_interception,
- 	[SVM_EXIT_VINTR]			= interrupt_window_interception,
- 	[SVM_EXIT_RDPMC]			= kvm_emulate_rdpmc,
--	[SVM_EXIT_CPUID]			= kvm_emulate_cpuid,
-+//	[SVM_EXIT_CPUID]			= kvm_emulate_cpuid,  // NIKA removed
-+	[SVM_EXIT_CPUID]			= cpuid_interception,  // NIKA added
- 	[SVM_EXIT_IRET]                         = iret_interception,
- 	[SVM_EXIT_INVD]                         = kvm_emulate_invd,
- 	[SVM_EXIT_PAUSE]			= pause_interception,
-@@ -3208,7 +3238,8 @@
+@@ -3206,7 +3223,8 @@
  	[SVM_EXIT_TASK_SWITCH]			= task_switch_interception,
  	[SVM_EXIT_SHUTDOWN]			= shutdown_interception,
  	[SVM_EXIT_VMRUN]			= vmrun_interception,
@@ -150,22 +116,33 @@
  	[SVM_EXIT_VMLOAD]			= vmload_interception,
  	[SVM_EXIT_VMSAVE]			= vmsave_interception,
  	[SVM_EXIT_STGI]				= stgi_interception,
-@@ -4237,6 +4268,13 @@
+@@ -3529,6 +3547,15 @@
+ 	if (is_guest_mode(vcpu)) {
+ 		int vmexit;
  
++		/*
++		 * KVM-AAVM: finish the hot architectural leaf-0 path before
++		 * nested-exit tracing, VMCB12 ownership checks and handler dispatch.
++		 * KVM's CPUID table remains the sole source of guest-visible values.
++		 */
++		if (svm->vmcb->control.exit_code == SVM_EXIT_CPUID &&
++		    kvm_rax_read(vcpu) == 0)
++			return kvm_emulate_cpuid(vcpu);
++
+ 		trace_kvm_nested_vmexit(vcpu, KVM_ISA_SVM);
+ 
+ 		vmexit = nested_svm_exit_special(svm);
+@@ -4233,6 +4260,7 @@
+ 		return EXIT_FASTPATH_EXIT_USERSPACE;
+ 	}
+ 
++
  	sync_lapic_to_cr8(vcpu);
  
-+	if (unlikely(vcpu->infer_intercept)) {  // VIRTFUNC begin
-+		vcpu->infer_intercept = false;
-+		if (vcpu->intercept_cpuid) svm_set_intercept(to_svm(vcpu), INTERCEPT_CPUID);
-+		else svm_clr_intercept(to_svm(vcpu), INTERCEPT_CPUID);
-+		vmcb_mark_dirty(svm->vmcb, VMCB_INTERCEPTS);
-+	}  // VIRTFUNC end
-+
  	if (unlikely(svm->asid != svm->vmcb->control.asid)) {
- 		svm->vmcb->control.asid = svm->asid;
- 		vmcb_mark_dirty(svm->vmcb, VMCB_ASID);
---- a/arch/x86/kvm/svm/svm.h	2026-04-22 12:30:53.000000000 +0100
-+++ b/arch/x86/kvm/svm/svm.h	2026-07-24 15:47:20.773520065 +0100
+diff -urN a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+--- a/arch/x86/kvm/svm/svm.h	2026-08-29 21:35:16.748226955 +0800
++++ b/arch/x86/kvm/svm/svm.h	2026-08-29 21:35:16.752047378 +0800
 @@ -673,7 +673,8 @@
  BUILD_SVM_MSR_BITMAP_HELPERS(void, clear, __clear)
  BUILD_SVM_MSR_BITMAP_HELPERS(void, set, __set)
@@ -176,9 +153,10 @@
  
  /* svm.c */
  extern bool dump_invalid_vmcb;
---- a/arch/x86/kvm/x86.c	2026-04-22 12:30:53.000000000 +0100
-+++ b/arch/x86/kvm/x86.c	2026-08-02 16:56:07.046265802 +0100
-@@ -543,6 +543,9 @@
+diff -urN a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+--- a/arch/x86/kvm/x86.c	2026-08-29 21:35:16.749377408 +0800
++++ b/arch/x86/kvm/x86.c	2026-08-29 21:35:16.752443492 +0800
+@@ -541,6 +541,9 @@
  		return 0;
  
  	if (!ignore_msrs) {
@@ -188,20 +166,10 @@
  		kvm_debug_ratelimited("unhandled %s: 0x%x data 0x%llx\n",
  				      op, msr, *data);
  		return ret;
---- a/include/linux/kvm_host.h	2026-04-22 12:30:53.000000000 +0100
-+++ b/include/linux/kvm_host.h	2026-08-02 14:55:53.253993254 +0100
-@@ -353,6 +353,10 @@
- 	unsigned int halt_poll_ns;
- 	bool valid_wakeup;
- 
-+	u64 last_exit_start;  // NIKA added
-+	bool intercept_cpuid;  // NIKA added
-+	bool infer_intercept;  // NIKA added
-+
- #ifdef CONFIG_HAS_IOMEM
- 	int mmio_needed;
- 	int mmio_read_completed;
-@@ -883,11 +887,15 @@
+diff -urN a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+--- a/include/linux/kvm_host.h	2026-08-29 21:35:16.750505281 +0800
++++ b/include/linux/kvm_host.h	2026-08-29 21:35:16.752874566 +0800
+@@ -882,11 +882,15 @@
  	pr_err("kvm [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)
  #define kvm_info(fmt, ...) \
  	pr_info("kvm [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)
@@ -220,3 +188,25 @@
  #define kvm_pr_unimpl(fmt, ...) \
  	pr_err_ratelimited("kvm [%i]: " fmt, \
  			   task_tgid_nr(current), ## __VA_ARGS__)
+
+diff -urN a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@ -1611,6 +1611,17 @@
+ 	struct kvm_vcpu *vcpu = &svm->vcpu;
+ 
+ 	switch (exit_code) {
++	case SVM_EXIT_CPUID:
++		/*
++		 * KVM-AAVM: consume CPUID leaf 0 in L0 for every L2.  The
++		 * architectural result comes from KVM's static CPUID table and
++		 * avoids the extra L0 -> L1 -> L0 nested-exit round trip.  Do not
++		 * gate this on L2 hypercall state: that state is false for the
++		 * Hyper-V root partition.  Every other leaf retains L1 ownership.
++		 */
++		if (kvm_rax_read(vcpu) == 0)
++			return NESTED_EXIT_HOST;
++		break;
+ 	case SVM_EXIT_INTR:
+ 	case SVM_EXIT_NMI:
+ 	case SVM_EXIT_NPF:

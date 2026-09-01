@@ -70,6 +70,11 @@ file_VbeShim="$(pwd)/ovmf/OvmfPkg/Bhyve/BhyveRfbDxe/VbeShim.c"
 file_BhyveX64="$(pwd)/ovmf/OvmfPkg/Bhyve/BhyveX64.dsc"
 file_BhyveSmbiosPlatformDxe="$(pwd)/ovmf/OvmfPkg/Bhyve/SmbiosPlatformDxe/SmbiosPlatformDxe.c"
 file_SmbiosPlatformDxe="$(pwd)/ovmf/OvmfPkg/SmbiosPlatformDxe/SmbiosPlatformDxe.c"
+file_QemuQ35Hsti="$(pwd)/ovmf/OvmfPkg/VirtHstiDxe/QemuQ35.c"
+file_QemuPCHsti="$(pwd)/ovmf/OvmfPkg/VirtHstiDxe/QemuPC.c"
+file_PlatformUni="$(pwd)/ovmf/OvmfPkg/PlatformDxe/Platform.uni"
+file_SioComponentName="$(pwd)/ovmf/OvmfPkg/SioBusDxe/ComponentName.c"
+file_X86QemuLoadImageLib="$(pwd)/ovmf/OvmfPkg/Library/X86QemuLoadImageLib/X86QemuLoadImageLib.c"
 file_QemuFwCfgCacheInit="$(pwd)/ovmf/OvmfPkg/Library/QemuFwCfgLib/QemuFwCfgCacheInit.c"
 file_FwBlockService="$(pwd)/ovmf/OvmfPkg/QemuFlashFvbServicesRuntimeDxe/FwBlockService.c"
 file_QemuFlash="$(pwd)/ovmf/OvmfPkg/QemuFlashFvbServicesRuntimeDxe/QemuFlash.c"
@@ -94,6 +99,11 @@ if [[ -f "$file_VbeShim" ]]; then rm "$file_VbeShim"; fi
 if [[ -f "$file_BhyveX64" ]]; then rm "$file_BhyveX64"; fi
 if [[ -f "$file_BhyveSmbiosPlatformDxe" ]]; then rm "$file_BhyveSmbiosPlatformDxe"; fi
 if [[ -f "$file_SmbiosPlatformDxe" ]]; then rm "$file_SmbiosPlatformDxe"; fi
+if [[ -f "$file_QemuQ35Hsti" ]]; then rm "$file_QemuQ35Hsti"; fi
+if [[ -f "$file_QemuPCHsti" ]]; then rm "$file_QemuPCHsti"; fi
+if [[ -f "$file_PlatformUni" ]]; then rm "$file_PlatformUni"; fi
+if [[ -f "$file_SioComponentName" ]]; then rm "$file_SioComponentName"; fi
+if [[ -f "$file_X86QemuLoadImageLib" ]]; then rm "$file_X86QemuLoadImageLib"; fi
 if [[ -f "$file_QemuFwCfgCacheInit" ]]; then rm "$file_QemuFwCfgCacheInit"; fi
 if [[ -f "$file_FwBlockService" ]]; then rm "$file_FwBlockService"; fi
 if [[ -f "$file_QemuFlash" ]]; then rm "$file_QemuFlash"; fi
@@ -110,13 +120,85 @@ cp -a ovmfbackup/. ovmf
 cp -fr splash.bmp ovmf/MdeModulePkg/Logo/Logo.bmp
 cp -fr /sys/firmware/acpi/bgrt/image ovmf/MdeModulePkg/Logo/Logo.bmp
 
+# Keep board-level firmware identity coherent with the physical board whose
+# factory Secure Boot databases are imported into the guest VARS.
+read_dmi() {
+  local field="$1" fallback="$2" value
+  value=""
+  if [[ -r "/sys/class/dmi/id/${field}" ]]; then
+    value="$(tr -d '\000\r\n' < "/sys/class/dmi/id/${field}")"
+  fi
+  case "$value" in
+    ""|*'"'*|*'\\'*|*'|'*) value="$fallback" ;;
+  esac
+  printf '%s' "$value"
+}
+
+escape_sed_replacement() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//&/\\&}"
+  value="${value//|/\\|}"
+  printf '%s' "$value"
+}
+
+validate_identity_value() {
+  local label="$1" value="$2"
+  case "$value" in
+    ""|*$'\n'*|*$'\r'*|*'"'*|*'\\'*)
+      echo "Unsafe ${label} value; refusing to generate OVMF source" >&2
+      exit 1
+      ;;
+  esac
+}
+
+firmware_vendor="${KVM_AAVM_FIRMWARE_VENDOR:-$(read_dmi bios_vendor 'American Megatrends Inc.')}"
+firmware_version="${KVM_AAVM_FIRMWARE_VERSION:-$(read_dmi bios_version '440')}"
+firmware_date="${KVM_AAVM_FIRMWARE_DATE:-$(read_dmi bios_date '10/11/2017')}"
+board_vendor="${KVM_AAVM_BOARD_VENDOR:-$(read_dmi board_vendor 'ASUSTeK COMPUTER INC.')}"
+board_product="${KVM_AAVM_BOARD_PRODUCT:-$(read_dmi board_name 'TUF GAMING B850-PLUS WIFI')}"
+hsti_platform="${board_vendor} ${board_product}"
+validate_identity_value "firmware vendor" "$firmware_vendor"
+validate_identity_value "firmware version" "$firmware_version"
+validate_identity_value "firmware date" "$firmware_date"
+validate_identity_value "board vendor" "$board_vendor"
+validate_identity_value "board product" "$board_product"
+firmware_vendor_sed="$(escape_sed_replacement "$firmware_vendor")"
+firmware_version_sed="$(escape_sed_replacement "$firmware_version")"
+firmware_date_sed="$(escape_sed_replacement "$firmware_date")"
+hsti_platform_sed="$(escape_sed_replacement "$hsti_platform")"
+
+# SMBIOS Type 0 stores numeric BIOS release components separately from the
+# printable version. Keep both fields tied to the same host firmware string;
+# do not generate a random version/date that contradicts the factory key
+# provider shown elsewhere in the guest firmware.
+bios_digits="$(printf '%s' "$firmware_version" | tr -cd '0-9')"
+if [[ ${#bios_digits} -ge 2 ]]; then
+  bios_major_release="${bios_digits:0:2}"
+  bios_minor_release="${bios_digits:2:2}"
+elif [[ ${#bios_digits} -eq 1 ]]; then
+  bios_major_release="$bios_digits"
+  bios_minor_release=0
+else
+  bios_major_release=0
+  bios_minor_release=0
+fi
+bios_major_release="${bios_major_release#0}"
+bios_minor_release="${bios_minor_release#0}"
+bios_major_release="${bios_major_release:-0}"
+bios_minor_release="${bios_minor_release:-0}"
+
 echo "  $file_MdeModulePkg"
-echo "\"EDK II\"                                          -> \"American Megatrends Inc.\""
+echo "\"EDK II\"                                          -> \"${firmware_vendor}\""
 echo "\"INTEL \"                                          -> \"ALASKA\""
 echo "0x20202020324B4445                                -> 0x20202049204D2041" #"    2KDE","   I M A"
-sed -i "$file_MdeModulePkg" -Ee "s/\"EDK II\"/\"American Megatrends Inc.\"/"
+sed -i "$file_MdeModulePkg" -Ee "s|\"EDK II\"|\"${firmware_vendor_sed}\"|"
 sed -i "$file_MdeModulePkg" -Ee "s/\"INTEL \"/\"ALASKA\"/"
 sed -i "$file_MdeModulePkg" -Ee "s/0x20202020324B4445/0x20202049204D2041/"
+echo "Firmware vendor/version/date -> ${firmware_vendor} / ${firmware_version} / ${firmware_date}"
+sed -i "$file_MdeModulePkg" -Ee "s|(^[[:space:]]*gEfiMdeModulePkgTokenSpaceGuid\.PcdFirmwareVendor[|]L\")[^\"]*(\"[|]VOID.*)|\1${firmware_vendor_sed}\2|"
+sed -i "$file_MdeModulePkg" -Ee "s|(^[[:space:]]*gEfiMdeModulePkgTokenSpaceGuid\.PcdFirmwareVersionString[|]L\")[^\"]*(\"[|]VOID.*)|\1${firmware_version_sed}\2|"
+sed -i "$file_MdeModulePkg" -Ee "s|(^[[:space:]]*gEfiMdeModulePkgTokenSpaceGuid\.PcdFirmwareReleaseDateString[|]L\")[^\"]*(\"[|]VOID.*)|\1${firmware_date_sed}\2|"
 
 echo "  $file_Dsdt"
 echo "\"BHYVE\"                                           -> \"ALASKA\""
@@ -168,17 +250,12 @@ echo "\"BHYVE\"                                           -> \"ALASKA\""
 sed -i "$file_BhyveX64" -Ee "s/\"BHYVE\"/\"ALASKA\"/"
 
 echo "  $file_BhyveSmbiosPlatformDxe"
-version_major="$(shuf -i 1-9 -n 1)"
-version_minor="$(shuf -i 11-99 -n 1)"
-day="$(get_random_element "${numbers[@]}")"
-month="$(get_random_element "${numbers[@]}")"
-year="$(shuf -i 2015-2025 -n 1)"
-echo "\"EFI Development Kit II / OVMF\\0\"                           -> \"American Megatrends Inc.\\0\""
-echo "\"0.0.0\\0\"                                                   -> \"$version_major$version_minor\\0\""
-echo "\"02/06/2015\\0\"                                              -> \"$day/$month/$year\\0\""
-sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s/\"EFI Development Kit II \/ OVMF\\\\0\"/\"American Megatrends Inc.\\\\0\"/"
-sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s/\"0.0.0\\\\0\"/\"$version_major$version_minor\\\\0\"/"
-sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s/\"02\/06\/2015\\\\0\"/\"$day\/$month\/$year\\\\0\"/"
+echo "\"EFI Development Kit II / OVMF\\0\"                           -> \"${firmware_vendor}\\0\""
+echo "\"0.0.0\\0\"                                                   -> \"${firmware_version}\\0\""
+echo "\"02/06/2015\\0\"                                              -> \"${firmware_date}\\0\""
+sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s|\"EFI Development Kit II / OVMF\\\\0\"|\"${firmware_vendor_sed}\\\\0\"|"
+sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s|\"0.0.0\\\\0\"|\"${firmware_version_sed}\\\\0\"|"
+sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s#\"02/06/2015\\\\0\"#\"${firmware_date_sed}\\\\0\"#"
 echo "0xE800, // UINT16                    BiosSegment            -> 0xE000, // UINT16                    BiosSegment"
 echo "0,      // UINT8                     BiosSize               -> 0xFF,   // UINT8                     BiosSize"
 echo "1,   // BiosCharacteristicsNotSupported                     -> 0,   // BiosCharacteristicsNotSupported"
@@ -219,12 +296,12 @@ sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "/           \/\/ Remaining BiosCharac
 0x400013   // ReservedForVendor                             :32"
 echo "0,   // BiosReserved                                        -> 0x03, // BiosReserved"
 echo "0x1C // SystemReserved                                      -> 0x0D // SystemReserved"
-echo "0,     // UINT8                     SystemBiosMajorRelease  -> $version_major,     // UINT8                     SystemBiosMajorRelease"
-echo "0,     // UINT8                     SystemBiosMinorRelease  -> $version_minor,    // UINT8                     SystemBiosMinorRelease"
+echo "0,     // UINT8                     SystemBiosMajorRelease  -> $bios_major_release,     // UINT8                     SystemBiosMajorRelease"
+echo "0,     // UINT8                     SystemBiosMinorRelease  -> $bios_minor_release,    // UINT8                     SystemBiosMinorRelease"
 sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s/0,   \/\/ BiosReserved/0x03, \/\/ BiosReserved/"
 sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s/0x1C \/\/ SystemReserved/0x0D \/\/ SystemReserved/"
-sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s/0,     \/\/ UINT8                     SystemBiosMajorRelease/$version_major,     \/\/ UINT8                     SystemBiosMajorRelease/"
-sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s/0,     \/\/ UINT8                     SystemBiosMinorRelease/$version_minor,    \/\/ UINT8                     SystemBiosMinorRelease/"
+sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s/0,     \/\/ UINT8                     SystemBiosMajorRelease/$bios_major_release,     \/\/ UINT8                     SystemBiosMajorRelease/"
+sed -i "$file_BhyveSmbiosPlatformDxe" -Ee "s/0,     \/\/ UINT8                     SystemBiosMinorRelease/$bios_minor_release,    \/\/ UINT8                     SystemBiosMinorRelease/"
 
 echo "  $file_SmbiosPlatformDxe"
 echo "0xE800, // UINT16                    BiosSegment            -> 0xE000, // UINT16                    BiosSegment"
@@ -267,18 +344,25 @@ sed -i "$file_SmbiosPlatformDxe" -Ee "/    \/\/ Remaining BiosCharacteristics bi
 0x400013 // ReservedForVendor                             :32"
 echo "0,   // BiosReserved                                        -> 0x03, // BiosReserved"
 echo "0x1C // SystemReserved                                      -> 0x0D // SystemReserved"
-echo "0,     // UINT8                     SystemBiosMajorRelease  -> $version_major,     // UINT8                     SystemBiosMajorRelease"
-echo "0,     // UINT8                     SystemBiosMinorRelease  -> $version_minor,    // UINT8                     SystemBiosMinorRelease"
+echo "0,     // UINT8                     SystemBiosMajorRelease  -> $bios_major_release,     // UINT8                     SystemBiosMajorRelease"
+echo "0,     // UINT8                     SystemBiosMinorRelease  -> $bios_minor_release,    // UINT8                     SystemBiosMinorRelease"
 sed -i "$file_SmbiosPlatformDxe" -Ee "s/0,   \/\/ BiosReserved/0x03, \/\/ BiosReserved/"
 sed -i "$file_SmbiosPlatformDxe" -Ee "s/0x1C \/\/ SystemReserved/0x0D \/\/ SystemReserved/"
-sed -i "$file_SmbiosPlatformDxe" -Ee "s/0,     \/\/ UINT8                     SystemBiosMajorRelease/$version_major,     \/\/ UINT8                     SystemBiosMajorRelease/"
-sed -i "$file_SmbiosPlatformDxe" -Ee "s/0,     \/\/ UINT8                     SystemBiosMinorRelease/$version_minor,    \/\/ UINT8                     SystemBiosMinorRelease/"
-echo "VendStr = L\"unknown\";                                       -> VendStr = L\"American Megatrends Inc.\";"
-echo "VersStr = L\"unknown\";                                       -> VersStr = L\"$version_major$version_minor\";"
-echo "DateStr = L\"02/02/2022\";                                    -> DateStr = L\"$day/$month/$year\";"
-sed -i "$file_SmbiosPlatformDxe" -Ee "s/VendStr = L\"unknown\";/VendStr = L\"American Megatrends Inc.\";/"
-sed -i "$file_SmbiosPlatformDxe" -Ee "s/VersStr = L\"unknown\";/VersStr = L\"$version_major$version_minor\";/"
-sed -i "$file_SmbiosPlatformDxe" -Ee "s/DateStr = L\"02\/02\/2022\";/DateStr = L\"$day\/$month\/$year\";/"
+sed -i "$file_SmbiosPlatformDxe" -Ee "s/0,     \/\/ UINT8                     SystemBiosMajorRelease/$bios_major_release,     \/\/ UINT8                     SystemBiosMajorRelease/"
+sed -i "$file_SmbiosPlatformDxe" -Ee "s/0,     \/\/ UINT8                     SystemBiosMinorRelease/$bios_minor_release,    \/\/ UINT8                     SystemBiosMinorRelease/"
+echo "VendStr = L\"unknown\";                                       -> VendStr = L\"${firmware_vendor}\";"
+echo "VersStr = L\"unknown\";                                       -> VersStr = L\"${firmware_version}\";"
+echo "DateStr = L\"02/02/2022\";                                    -> DateStr = L\"${firmware_date}\";"
+sed -i "$file_SmbiosPlatformDxe" -Ee "s|VendStr = L\"unknown\";|VendStr = L\"${firmware_vendor_sed}\";|"
+sed -i "$file_SmbiosPlatformDxe" -Ee "s|VersStr = L\"unknown\";|VersStr = L\"${firmware_version_sed}\";|"
+sed -i "$file_SmbiosPlatformDxe" -Ee "s#DateStr = L\"02/02/2022\";#DateStr = L\"${firmware_date_sed}\";#"
+
+echo "HSTI platform descriptor -> ${hsti_platform}"
+sed -i "$file_QemuQ35Hsti" -Ee "s|L\"OVMF \\(Qemu Q35\\)\"|L\"${hsti_platform_sed}\"|"
+sed -i "$file_QemuPCHsti" -Ee "s|L\"OVMF \\(Qemu PC\\)\"|L\"${hsti_platform_sed}\"|"
+sed -i "$file_PlatformUni" -Ee "s|OVMF Platform Configuration|${hsti_platform_sed} Platform Configuration|g; s|OVMF Settings|${firmware_vendor_sed} Settings|g; s|OVMF|${firmware_vendor_sed}|g"
+sed -i "$file_SioComponentName" -Ee "s|OVMF Sio Bus Driver|${firmware_vendor_sed} Sio Bus Driver|"
+sed -i "$file_X86QemuLoadImageLib" -Ee "s|OVMF:|${firmware_vendor_sed}:|g"
 
 echo "  $file_QemuFwCfgCacheInit"
 get_new_string 4 1
@@ -308,10 +392,12 @@ echo "  $file_Driver"
 #get_new_string 4 1
 echo "L\"QEMU                                            -> L\"$new_string"
 sed -i "$file_Driver" -Ee "s/L\"QEMU/L\"$new_string/"
-IFS=':'
-cpu_vendor=( $(cat /proc/cpuinfo | grep 'vendor_id' | uniq) )
-cpu_vendor="${cpu_vendor[1]}"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
+cpu_vendor="$(awk -F: '/^vendor_id[[:space:]]*:/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}' /proc/cpuinfo)"
+if [[ "$cpu_vendor" != "AuthenticAMD" && "$cpu_vendor" != "GenuineIntel" ]]; then
+  echo "Unsupported x86 CPU vendor: ${cpu_vendor:-unknown}" >&2
+  exit 1
+fi
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
   echo "0x1234                                            -> 0x1022"
   echo "0x1b36                                            -> 0x1022"
   echo "0x1af4                                            -> 0x1022"
@@ -334,8 +420,8 @@ echo "0x1111                                            -> 0x$device"
 sed -i "$file_Driver" -Ee "s/0x1111/0x$device/"
 
 echo "  $file_ShellPkg"
-echo "\"EDK II\"                                          -> \"American Megatrends Inc.\""
-sed -i "$file_ShellPkg" -Ee "s/\"EDK II\"/\"American Megatrends Inc.\"/"
+echo "\"EDK II\"                                          -> \"${firmware_vendor}\""
+sed -i "$file_ShellPkg" -Ee "s|\"EDK II\"|\"${firmware_vendor_sed}\"|"
 
 echo "  $file_QemuBootOrderLib"
 get_new_string $(shuf -i 5-7 -n 1) 3
@@ -350,7 +436,7 @@ echo "L\"certdbv\"                                        -> L\"dbv${prefix}${su
 sed -i "$file_AuthServiceInternal" -Ee "s/L\"certdbv\"/L\"dbv${prefix}${suffix}\"/"
 
 echo "  $file_Q35MchIch9"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
   echo "INTEL_Q35_MCH_DEVICE_ID  0x29C0                   -> INTEL_Q35_MCH_DEVICE_ID  0x$edk2bridge_1022"
   sed -i "$file_Q35MchIch9" -Ee "s/INTEL_Q35_MCH_DEVICE_ID  0x29C0/INTEL_Q35_MCH_DEVICE_ID  0x$edk2bridge_1022/"
 else
@@ -421,79 +507,9 @@ if [[ $REPLY =~ ^[Nn]$ ]]; then
 else
   echo ""
 fi
-
-
-cd "$SCRIPT_DIR"
-WORK_DIR="$(pwd)/work"
-mkdir -p "$WORK_DIR"
-cd "$WORK_DIR"
-
-TEMP_JSON="temp.json"
-DEFAULTS_JSON="defaults.json"
-EFIVARS_DIR="/sys/firmware/efi/efivars"
-VARS_LIST=("db" "dbx" "KEK" "PK" "dbDefault" "dbxDefault" "KEKDefault" "PKDefault")
-declare -A GUIDS_LIST=(
-          ["db"]="d719b2cb-3d3a-4596-a3bc-dad00e67656f"
-         ["dbx"]="d719b2cb-3d3a-4596-a3bc-dad00e67656f"
-         ["KEK"]="8be4df61-93ca-11d2-aa0d-00e098032b8c"
-          ["PK"]="8be4df61-93ca-11d2-aa0d-00e098032b8c"
-   ["dbDefault"]="8be4df61-93ca-11d2-aa0d-00e098032b8c"
-  ["dbxDefault"]="8be4df61-93ca-11d2-aa0d-00e098032b8c"
-  ["KEKDefault"]="8be4df61-93ca-11d2-aa0d-00e098032b8c"
-   ["PKDefault"]="8be4df61-93ca-11d2-aa0d-00e098032b8c"
-)
-
-{
-  printf '%s\n' '{'
-  printf '%s\n' '    "version": 2,'
-  printf '%s\n' '    "variables": ['
-  sep=""
-  if [[ -d "$EFIVARS_DIR" ]]; then
-    for var in "${VARS_LIST[@]}"; do
-      guid="${GUIDS_LIST[$var]}"
-      filepath="$EFIVARS_DIR/${var}-${guid}"
-      if [[ -f "$filepath" ]]; then
-        raw_data=$(sudo hexdump -v -e '1/1 "%.2x"' "$filepath" 2>/dev/null) || raw_data=""
-        if [[ ${#raw_data} -ge 8 ]]; then
-          attr_hex="${raw_data:6:2}${raw_data:4:2}${raw_data:2:2}${raw_data:0:2}"
-          if [[ "$attr_hex" =~ ^[0-9a-fA-F]+$ ]]; then
-            attr=$((16#$attr_hex))
-          else
-            attr=0
-          fi
-          data_hex="${raw_data:8}"
-# Build JSON
-          printf '%s\n' "        $sep{"
-          printf '            "name": "%s",\n' "$var"
-          printf '            "guid": "%s",\n' "$guid"
-          printf '            "attr": %d,\n' "$attr"
-          printf '            "data": "%s"\n' "$data_hex"
-          printf '%s\n' '        }'
-          sep=","
-        fi
-      fi
-    done
-  fi
-  printf '%s\n' '    ]'
-  printf '%s\n' '}'
-} > "$TEMP_JSON"
-
-if [[ -f "$DEFAULTS_JSON" ]]; then
-  read -p $'Renew EFI variables? [y/\e[1mN\e[0m]> ' -n 1 -r
-  if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo ""
-    cp -f "$TEMP_JSON" "$DEFAULTS_JSON"
-    echo "$TEMP_JSON"
-  else
-    echo ""
-    echo "$DEFAULTS_JSON"
-  fi
-else
-  cp -f "$TEMP_JSON" "$DEFAULTS_JSON"
-  echo "$TEMP_JSON"
-fi
-
+# Do not copy host UEFI variables into a build artifact. The deployer reads
+# only the motherboard factory variables at Secure Boot configuration time,
+# combines them with Microsoft keys, and removes custom key material.
 virt-fw-vars --input "$VARS_DEST" --output "$VARS_DEST_2" \
   --set-false CustomMode \
-  --set-false SecureBootEnable \
-  --set-json "$DEFAULTS_JSON"
+  --set-false SecureBootEnable

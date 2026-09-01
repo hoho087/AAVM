@@ -60,6 +60,30 @@ def _read_cpuinfo() -> dict[str, str]:
     return values
 
 
+def _cpu_apic_ids() -> dict[str, int]:
+    """Return Linux logical CPU -> native initial APIC ID from /proc/cpuinfo."""
+    try:
+        blocks = Path("/proc/cpuinfo").read_text(errors="replace").split("\n\n")
+    except OSError:
+        return {}
+    result: dict[str, int] = {}
+    for block in blocks:
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            fields[key.strip()] = value.strip()
+        logical = fields.get("processor")
+        apic = fields.get("initial apicid", fields.get("apicid"))
+        try:
+            if logical is not None and apic is not None:
+                result[str(int(logical))] = int(apic)
+        except ValueError:
+            continue
+    return result
+
+
 def _cpu_topology() -> tuple[list[list[int]], int]:
     """Return online logical CPUs grouped by physical package/core.
 
@@ -89,8 +113,14 @@ def _cpu_topology() -> tuple[list[list[int]], int]:
     return ordered, max(1, len(packages))
 
 
-def vm_cpu_layout(info: dict, vcpus: int) -> dict:
-    """Build an SMT-aware guest topology and an optional physical CPU map."""
+def vm_cpu_layout(info: dict, vcpus: int, shared_emulator_cores: int = 0) -> dict:
+    """Build an SMT-aware guest topology and an optional physical CPU map.
+
+    ``shared_emulator_cores`` is reserved for the full-topology AMD
+    SVME-gated CPUID profile.  In that profile every native APIC ID must have
+    a matching vCPU, so QEMU's emulator thread shares the final complete SMT
+    cores instead of requiring CPUs outside the guest pin set.
+    """
     requested = max(1, int(vcpus))
     sibling_groups = [
         sorted({int(cpu) for cpu in group})
@@ -103,7 +133,10 @@ def vm_cpu_layout(info: dict, vcpus: int) -> dict:
     threads = 2 if host_threads >= 2 and requested % 2 == 0 else 1
     eligible = [group for group in sibling_groups if len(group) >= threads]
     guest_cores = requested // threads
-    if len(eligible) <= guest_cores:
+    allow_shared_emulator = int(shared_emulator_cores) > 0
+    if len(eligible) < guest_cores or (
+        len(eligible) == guest_cores and not allow_shared_emulator
+    ):
         return {
             "threads_per_core": threads,
             "cores": guest_cores,
@@ -111,6 +144,53 @@ def vm_cpu_layout(info: dict, vcpus: int) -> dict:
             "vcpu_pins": [],
             "emulator_cpus": [],
         }
+
+    # In the AMD SVME-gated mode, CPUID reports the physical CPU's native APIC
+    # ID after the outer Hyper-V enables EFER.SVME.  Pin vCPU N to the host
+    # logical CPU whose native APIC ID is N so Hyper-V's one-socket
+    # core/thread topology remains coherent.  Firmware and the ordinary
+    # Windows boot path still use KVM's intercepted CPUID model.
+    native_apic_ids: dict[int, int] = {}
+    for cpu, apic_id in info.get("native_apic_ids", {}).items():
+        try:
+            native_apic_ids[int(cpu)] = int(apic_id)
+        except (TypeError, ValueError):
+            continue
+    if info.get("vendor") == "amd" and native_apic_ids:
+        cpu_by_apic = {apic_id: cpu for cpu, apic_id in native_apic_ids.items()}
+        aligned = [cpu_by_apic.get(vcpu) for vcpu in range(requested)]
+        if all(cpu is not None for cpu in aligned) and len(set(aligned)) == requested:
+            pins = [int(cpu) for cpu in aligned if cpu is not None]
+            selected_cpus = set(pins)
+            # Only accept a mapping made of complete SMT core groups.  This
+            # preserves the guest topology and leaves complete cores to Linux.
+            selected_groups = [
+                group for group in eligible
+                if set(group[:threads]).issubset(selected_cpus)
+            ]
+            if len(selected_groups) == guest_cores:
+                emulator = sorted({
+                    cpu for group in sibling_groups for cpu in group
+                    if cpu not in selected_cpus
+                })
+                if not emulator and allow_shared_emulator:
+                    shared_groups = selected_groups[-min(
+                        int(shared_emulator_cores), len(selected_groups)
+                    ):]
+                    emulator = sorted({
+                        cpu for group in shared_groups for cpu in group[:threads]
+                    })
+                if emulator:
+                    return {
+                        "threads_per_core": threads,
+                        "cores": guest_cores,
+                        "vcpus": requested,
+                        "vcpu_pins": pins,
+                        "emulator_cpus": emulator,
+                        "emulator_shared": bool(
+                            selected_cpus.intersection(emulator)
+                        ),
+                    }
 
     # Keep the first physical cores for Ubuntu and QEMU's emulator thread;
     # assign complete SMT sibling pairs from the remaining cores to the guest.
@@ -161,8 +241,44 @@ def cpu_info() -> dict:
         "cores": cores,
         "threads_per_core": threads,
         "thread_siblings": sibling_groups,
+        "native_apic_ids": _cpu_apic_ids(),
         "sockets": sockets,
         "virtualization": "svm" if "svm" in flags else "vmx" if "vmx" in flags else None,
+        # Store only feature bits consumed by this deployer.  Older AMD CPUs
+        # may provide SVM/NPT without AVIC or topoext; treating every AMD CPU
+        # as a current Zen desktop made otherwise valid profiles fail at QEMU
+        # feature validation.
+        "x86_features": sorted(flags & {"svm", "npt", "avic", "topoext"}),
+    }
+
+
+def _module_parameter_enabled(module: str, parameter: str) -> bool:
+    try:
+        value = Path(f"/sys/module/{module}/parameters/{parameter}").read_text().strip().lower()
+    except OSError:
+        return False
+    return value in {"1", "y", "yes", "on"}
+
+
+def kvm_capabilities(cpu: dict | None = None) -> dict[str, bool]:
+    """Return only KVM capabilities that are safe to encode in a VM profile."""
+    cpu = cpu or cpu_info()
+    if cpu.get("vendor") != "amd":
+        return {"nested": False, "npt": False, "avic": False, "gmet": False}
+    features = set(cpu.get("x86_features", []))
+    # Profiles created before x86_features was recorded retain the old module
+    # parameter behavior.  Fresh profiles additionally gate hardware-specific
+    # acceleration, without changing current Zen behavior.
+    feature_data_available = "x86_features" in cpu
+    npt_supported = not feature_data_available or "npt" in features
+    avic_supported = not feature_data_available or "avic" in features
+    nested = _module_parameter_enabled("kvm_amd", "nested")
+    npt = npt_supported and _module_parameter_enabled("kvm_amd", "npt")
+    return {
+        "nested": nested,
+        "npt": npt,
+        "avic": avic_supported and _module_parameter_enabled("kvm_amd", "avic"),
+        "gmet": nested and npt and _module_parameter_enabled("kvm_amd", "gmet"),
     }
 
 
@@ -282,11 +398,13 @@ def gpu_groups(devices: list[PciDevice]) -> list[list[PciDevice]]:
 def host_fingerprint(devices: list[PciDevice] | None = None) -> dict:
     provided_devices = devices is not None
     devices = devices if provided_devices else pci_devices()
+    cpu = cpu_info()
     return {
         "os": platform.freedesktop_os_release().get("PRETTY_NAME", platform.platform()),
         "arch": platform.machine(),
         "kernel": platform.release(),
-        "cpu": cpu_info(),
+        "cpu": cpu,
+        "kvm": kvm_capabilities(cpu),
         "memory_gib": memory_gib(),
         "iommu_group_count": len(list(Path("/sys/kernel/iommu_groups").glob("*"))),
         "kvm_device": Path("/dev/kvm").exists(),
@@ -323,6 +441,10 @@ def device_identity(devices: list[PciDevice], cpu_vendor: str) -> dict[str, str]
     def first(classes: set[str], default: str) -> PciDevice | str:
         return next((d for d in relevant if d.class_code in classes), default)
 
+    # Every fallback is a real, publicly assigned chipset device ID.  Do not
+    # use QEMU/Red Hat/Bochs IDs or generated numbers here: these values become
+    # PCI identities in the patched firmware when a class is absent from
+    # lspci (common for storage and integrated audio on some AMD systems).
     defaults = {
         "amd": {
             "lpc": "790e",
@@ -354,7 +476,7 @@ def device_identity(devices: list[PciDevice], cpu_vendor: str) -> dict[str, str]
         "rootport": first({"0604"}, defaults["rootport"]),
         "xhci": first({"0c03"}, defaults["xhci"]),
         "hostbridge": first({"0600"}, defaults["hostbridge"]),
-        "pcibridge": first({"0500", "0604"}, defaults["pcibridge"]),
+        "pcibridge": first({"0604"}, defaults["pcibridge"]),
     }
 
     output = {

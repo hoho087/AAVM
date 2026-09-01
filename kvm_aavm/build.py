@@ -11,7 +11,10 @@ from .paths import OFFLINE_DIR, PROJECT_DIR, vm_dir
 from .util import AppError, Runner, atomic_write, require_root
 
 
-LEGACY_FILES = ["qemupatch.sh", "ovmfpatch.sh", "splash.bmp", "ssdt1.dsl", "ssdt2.dsl"]
+LEGACY_FILES = [
+    "qemupatch.sh", "ovmfpatch.sh",
+    "splash.bmp", "ssdt1.dsl", "ssdt2.dsl",
+]
 DEFAULT_MAX_BUILD_JOBS = 4
 
 
@@ -30,6 +33,139 @@ def _validate_generated_vars(path: Path) -> None:
             f"0x{cpu_hotplug_base:X}. It must be 4-byte aligned and leave "
             "room below 0x10000; refusing to build an OVMF image that would "
             "deadlock in CpuHotplugSmm."
+        )
+
+
+def _validate_qemu_firmware_hardening(qemu_source: Path) -> None:
+    """Ensure the patched HPET AML does not retain VMAware's QEMU shape."""
+    acpi_build = qemu_source / "hw/i386/acpi-build.c"
+    if not acpi_build.is_file():
+        raise AppError(f"Patched QEMU ACPI source is missing: {acpi_build}")
+    text = acpi_build.read_text(encoding="utf-8")
+    expected = "aml_lless(aml_int(41666666), period)"
+    legacy = "aml_lgreater(period, aml_int(41666666))"
+    if expected not in text or legacy in text:
+        raise AppError(
+            "QEMU HPET firmware hardening was not applied; refusing to "
+            "publish artifacts with the legacy AML validation shape."
+        )
+
+
+def _validate_qemu_kvm_hypercall_hardening(qemu_source: Path) -> None:
+    """Ensure QEMU disables KVM's cross-vendor hypercall rewrite quirk."""
+    kvm_source = qemu_source / "target/i386/kvm/kvm.c"
+    if not kvm_source.is_file():
+        raise AppError(f"Patched QEMU KVM source is missing: {kvm_source}")
+    text = kvm_source.read_text(encoding="utf-8")
+    required = (
+        "KVM-AAVM: disable KVM hypercall rewrite quirk.",
+        "kvm_vm_enable_cap(s, KVM_CAP_DISABLE_QUIRKS2, 0",
+        "KVM_X86_QUIRK_FIX_HYPERCALL_INSN",
+    )
+    if any(value not in text for value in required):
+        raise AppError(
+            "QEMU KVM hypercall hardening was not applied; refusing to publish "
+            "artifacts that retain KVM VMCALL/VMMCALL rewriting."
+        )
+
+
+def _validate_ovmf_firmware_identity(
+    ovmf_source: Path, expected_firmware: dict[str, str] | None = None,
+) -> None:
+    """Reject OVMF's default BIOS identity in a published firmware build."""
+    declarations = ovmf_source / "MdeModulePkg/MdeModulePkg.dec"
+    if not declarations.is_file():
+        raise AppError(f"Patched OVMF declarations are missing: {declarations}")
+    text = declarations.read_text(encoding="utf-8")
+    expected = {
+        "PcdFirmwareVendor": re.compile(
+            r"PcdFirmwareVendor\|L\"([^\"]+)\""
+        ),
+        "PcdFirmwareVersionString": re.compile(
+            r"PcdFirmwareVersionString\|L\"([^\"]+)\""
+        ),
+        "PcdFirmwareReleaseDateString": re.compile(
+            r"PcdFirmwareReleaseDateString\|L\"([^\"]+)\""
+        ),
+    }
+    values: dict[str, str] = {}
+    for name, pattern in expected.items():
+        match = pattern.search(text)
+        value = match.group(1).strip() if match else ""
+        if not value:
+            raise AppError(
+                f"Patched OVMF {name} is empty; refusing to publish firmware "
+                "with the generic 440/10/11/2017 BIOS fallback."
+            )
+        values[name] = value
+    if re.search(r"(?:edk\s*ii|ovmf|tianocore)", values["PcdFirmwareVendor"], re.I):
+        raise AppError(
+            "Patched OVMF still advertises an EDK2/OVMF firmware vendor; "
+            "refusing to publish a detectable generic Secure Boot image."
+        )
+    if expected_firmware:
+        expected = {
+            "PcdFirmwareVendor": expected_firmware.get("vendor", ""),
+            "PcdFirmwareVersionString": expected_firmware.get("version", ""),
+            "PcdFirmwareReleaseDateString": expected_firmware.get("date", ""),
+        }
+        mismatches = [
+            f"{name}={values[name]!r} (expected {value!r})"
+            for name, value in expected.items()
+            if value and values[name] != value
+        ]
+        if mismatches:
+            raise AppError(
+                "Patched OVMF BIOS identity does not match the Secure Boot board profile: "
+                + "; ".join(mismatches)
+            )
+        # The two SMBIOS producers are compiled separately from the PCD
+        # declarations. Check both source files so a future patch cannot make
+        # Windows see a different Type 0 BIOS identity at runtime.
+        for relative in (
+            "OvmfPkg/Bhyve/SmbiosPlatformDxe/SmbiosPlatformDxe.c",
+            "OvmfPkg/SmbiosPlatformDxe/SmbiosPlatformDxe.c",
+        ):
+            source = ovmf_source / relative
+            if not source.is_file():
+                raise AppError(f"Patched OVMF SMBIOS source is missing: {source}")
+            source_text = source.read_text(encoding="utf-8")
+            missing = [value for value in expected.values() if value and value not in source_text]
+            if missing:
+                raise AppError(
+                    f"Patched OVMF SMBIOS source {source} is missing: "
+                    + ", ".join(missing)
+                )
+
+
+def _validate_ovmf_measured_boot(ovmf_source: Path) -> None:
+    """Require the TPM2 measurement and TCG2 event-log modules in OVMF."""
+    required = {
+        "OvmfPkg/Include/Dsc/OvmfTpmComponentsPei.dsc.inc": (
+            "SecurityPkg/Tcg/Tcg2Pei/Tcg2Pei.inf",
+            "SecurityPkg/Tcg/Tcg2PlatformPei/Tcg2PlatformPei.inf",
+        ),
+        "OvmfPkg/Include/Dsc/OvmfTpmComponentsDxe.dsc.inc": (
+            "SecurityPkg/Tcg/Tcg2Dxe/Tcg2Dxe.inf",
+            "SecurityPkg/Tcg/Tcg2PlatformDxe/Tcg2PlatformDxe.inf",
+        ),
+        "OvmfPkg/Include/Fdf/OvmfTpmDxe.fdf.inc": (
+            "SecurityPkg/Tcg/Tcg2Dxe/Tcg2Dxe.inf",
+            "SecurityPkg/Tcg/Tcg2PlatformDxe/Tcg2PlatformDxe.inf",
+        ),
+    }
+    missing: list[str] = []
+    for relative, markers in required.items():
+        path = ovmf_source / relative
+        if not path.is_file():
+            missing.append(relative)
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        missing.extend(f"{relative}:{marker}" for marker in markers if marker not in text)
+    if missing:
+        raise AppError(
+            "OVMF TPM2 measured-boot/event-log components are incomplete: "
+            + ", ".join(missing)
         )
 
 
@@ -88,6 +224,9 @@ def _adapt_qemu_script(text: str, output: Path, hardware: dict[str, str]) -> str
 
 
 def _adapt_ovmf_script(text: str, output: Path) -> str:
+    for flag in ("-D SECURE_BOOT_ENABLE", "-D SMM_REQUIRE", "-D TPM2_ENABLE"):
+        if flag not in text:
+            raise AppError(f"OVMF build script is missing required flag: {flag}")
     text = _enable_fail_fast(text)
     text = _replace_assignment(text, "EDK2_DEST", str(output / "ovmf"))
     text, count = re.subn(
@@ -136,15 +275,39 @@ def _stage(vm_name: str, generation: int, profile: dict) -> tuple[Path, Path]:
     return work, output
 
 
-def build_all(vm_name: str, profile: dict, runner: Runner) -> dict:
+def build_all(
+    vm_name: str, profile: dict, runner: Runner, *, generation: int | None = None,
+) -> dict:
     require_root()
-    generation = int(profile["identity"]["generation"])
+    generation = int(profile["identity"]["generation"] if generation is None else generation)
     work, output = _stage(vm_name, generation, profile)
     (output / "bin").mkdir(parents=True, exist_ok=True)
     (output / "share/qemu").mkdir(parents=True, exist_ok=True)
     (output / "ovmf").mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["KVM_AAVM_AUTO_YES"] = "1"
+    # A Secure Boot VM keeps the BIOS identity captured with the motherboard
+    # host Secure Boot snapshot. Rebuilding on the same host must not randomize
+    # Type 0 vendor/version/date or silently diverge from its PK provider.
+    firmware = profile.get("identity_firmware", {})
+    board = profile.get("identity_board", {})
+    if isinstance(firmware, dict):
+        for field, variable in (
+            ("vendor", "KVM_AAVM_FIRMWARE_VENDOR"),
+            ("version", "KVM_AAVM_FIRMWARE_VERSION"),
+            ("date", "KVM_AAVM_FIRMWARE_DATE"),
+        ):
+            value = firmware.get(field)
+            if isinstance(value, str) and value and all(char not in value for char in "\x00\r\n\""):
+                env[variable] = value
+    if isinstance(board, dict):
+        for field, variable in (
+            ("manufacturer", "KVM_AAVM_BOARD_VENDOR"),
+            ("product", "KVM_AAVM_BOARD_PRODUCT"),
+        ):
+            value = board.get(field)
+            if isinstance(value, str) and value and all(char not in value for char in "\x00\r\n\""):
+                env[variable] = value
     requested_jobs = env.get("KVM_AAVM_BUILD_JOBS", "").strip()
     if requested_jobs:
         if not requested_jobs.isdigit() or int(requested_jobs) < 1:
@@ -154,7 +317,11 @@ def build_all(vm_name: str, profile: dict, runner: Runner) -> dict:
     print(f"QEMU build parallelism: {env['KVM_AAVM_BUILD_JOBS']} job(s)")
     runner.run(["bash", "qemupatch.sh"], cwd=work, env=env)
     _validate_generated_vars(work / "vars.sh")
+    _validate_qemu_firmware_hardening(work / "qemu")
+    _validate_qemu_kvm_hypercall_hardening(work / "qemu")
     runner.run(["bash", "ovmfpatch.sh"], cwd=work, env=env)
+    _validate_ovmf_firmware_identity(work / "ovmf", profile.get("identity_firmware"))
+    _validate_ovmf_measured_boot(work / "ovmf")
     if (work / "vars.sh").exists():
         shutil.copy2(work / "vars.sh", vm_dir(vm_name) / f"vars-generation-{generation}.sh")
     expected = [

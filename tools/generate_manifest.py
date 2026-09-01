@@ -41,7 +41,7 @@ def main() -> int:
         if path.is_file() and path.name != "manifest.json":
             files.append({"path": str(path.relative_to(root)), "size": path.stat().st_size, "sha256": digest(path)})
     sources = {}
-    for name in ("qemu", "edk2", "linux-tkg", "linux"):
+    for name in ("qemu", "edk2", "linux-tkg", "linux", "linux-7.2", "libtpms"):
         revision = git_revision(root / "sources" / name)
         if revision:
             sources[name] = revision

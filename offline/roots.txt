@@ -1,10 +1,10 @@
 openssh-server
-virt-viewer
 qemu-system-x86
 qemu-system-gui
 qemu-system-modules-spice
 qemu-utils
 qemu-block-extra
+virt-viewer
 libvirt-daemon-system
 libvirt-clients
 virt-manager
@@ -15,6 +15,7 @@ libxml2-utils
 ovmf
 swtpm
 swtpm-tools
+libtpms0
 bridge-utils
 cpu-checker
 dnsmasq-base
@@ -74,6 +75,9 @@ cpio
 fakeroot
 devscripts
 debhelper
+dh-exec
+libtool
+gawk
 rsync
 kmod
 initramfs-tools

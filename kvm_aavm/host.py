@@ -33,7 +33,7 @@ UPDATE_PROTECTED_PACKAGE_PATTERNS = (
     re.compile(r"^(?:qemu|libvirt)(?:[-0-9]|$)"),
     re.compile(r"^python3-libvirt$"),
     re.compile(r"^(?:virt-manager|virt-viewer|virtinst)$"),
-    re.compile(r"^(?:ovmf|seabios|swtpm)(?:-|$)"),
+    re.compile(r"^(?:ovmf|seabios|swtpm|libtpms)(?:[-0-9]|$)"),
     re.compile(r"^(?:nvidia|libnvidia|xserver-xorg-video-nvidia)(?:-|$)"),
     re.compile(r"^amdgpu(?:-|$)"),
 )
@@ -95,6 +95,13 @@ def _set_nested_module_option(text: str, module: str, enabled: bool) -> str:
     if not found:
         updated.append(f"options {module} nested={desired}")
     return "\n".join(updated).rstrip() + "\n"
+
+
+def _managed_kvm_module_config(vendor: str) -> str:
+    """Return the persistent host KVM options required by managed VMs."""
+    if vendor == "amd":
+        return "options kvm_amd nested=1 avic=1\noptions kvm ignore_msrs=0\n"
+    return "options kvm_intel nested=1\noptions kvm ignore_msrs=0\n"
 
 
 def ensure_nested_virtualization(runner: Runner) -> None:
@@ -442,7 +449,7 @@ def configure_host(runner: Runner, *, memflow: bool = False) -> None:
     module = "kvm_amd" if info["vendor"] == "amd" else "kvm_intel"
     # Nested capability is prepared globally, but no guest sees SVM/VMX unless
     # its per-VM Core Isolation/VBS option is explicitly enabled.
-    atomic_write(KVM_MODPROBE_CONFIG, f"options {module} nested=1\noptions kvm ignore_msrs=0\n")
+    atomic_write(KVM_MODPROBE_CONFIG, _managed_kvm_module_config(info["vendor"]))
     configure_vfio_module_options()
     atomic_write(Path("/etc/modules-load.d/kvm-aavm.conf"), "vfio\nvfio_iommu_type1\nvfio_pci\n")
     runner.run(["update-initramfs", "-u", "-k", "all"])

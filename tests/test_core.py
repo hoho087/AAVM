@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import inspect
+import json
+import runpy
+import shutil
+import struct
 import subprocess
 import tempfile
 from contextlib import nullcontext
@@ -9,18 +13,28 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from kvm_aavm import cli, hooks, host, kernel, offline, vm
-from kvm_aavm.build import _adapt_qemu_script, _validate_generated_vars
-from kvm_aavm.hardware import PciDevice, parse_usb_line, vm_cpu_layout
-from kvm_aavm.host import _replace_grub_args, _set_nested_module_option
-from kvm_aavm.identity import generate, mac_address, rerandomize
+from kvm_aavm import build, cli, hooks, host, kernel, offline, state, vm
+from kvm_aavm.build import (
+    _adapt_qemu_script,
+    _validate_generated_vars,
+    _validate_ovmf_firmware_identity,
+    _validate_ovmf_measured_boot,
+    _validate_qemu_firmware_hardening,
+    _validate_qemu_kvm_hypercall_hardening,
+)
+from kvm_aavm.hardware import (
+    PciDevice, device_identity, kvm_capabilities, parse_usb_line, vm_cpu_layout,
+)
+from kvm_aavm.host import _managed_kvm_module_config, _replace_grub_args, _set_nested_module_option
+from kvm_aavm.identity import apply_board_identity, generate, mac_address, rerandomize
 from kvm_aavm.util import AppError
 from kvm_aavm.vm import _ensure_disk, _ensure_install_ovmf_code, _stage_install_media
 from kvm_aavm.xmlgen import (
-    INSTALL_MACHINE_TYPE, INSTALL_OVMF_CODE, INSTALL_OVMF_VARS, INSTALL_QEMU,
+    AAVM_NS, INSTALL_MACHINE_TYPE, INSTALL_OVMF_CODE, INSTALL_OVMF_VARS, INSTALL_QEMU,
     build_domain_xml, update_artifact_paths, update_identity,
     update_passthrough, validate_required,
 )
+from tools import prune_superseded_debs
 
 
 def profile() -> dict:
@@ -52,8 +66,71 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(after["identity"]["generation"], before["identity"]["generation"] + 1)
         self.assertNotEqual(after["identity"]["domain_uuid"], before["identity"]["domain_uuid"])
 
+    def test_identity_platform_matches_cpu_vendor(self):
+        amd = generate({"vendor": "amd", "model": "AMD Test CPU"})
+        intel = generate({"vendor": "intel", "model": "Intel Test CPU"})
+        self.assertNotIn(amd["manufacturer"], {"Dell Inc.", "LENOVO"})
+        self.assertNotIn(
+            intel["product"],
+            {"TUF GAMING B850-PLUS WIFI", "B650 AORUS ELITE AX", "PRO B650-P WIFI"},
+        )
+
+    def test_board_pin_preserves_randomized_serials_and_future_identity_rotation(self):
+        before = profile()
+        serials = {
+            key: before["identity"][key]
+            for key in ("system_serial", "baseboard_serial", "chassis_serial")
+        }
+        board = {
+            "manufacturer": "ASUSTeK COMPUTER INC.",
+            "product": "TUF GAMING B850-PLUS WIFI",
+            "version": "Rev 1.xx",
+        }
+        aligned = apply_board_identity(before["identity"], board)
+        self.assertEqual(aligned["manufacturer"], board["manufacturer"])
+        self.assertEqual(aligned["product"], board["product"])
+        self.assertEqual(aligned["baseboard_product"], board["product"])
+        self.assertEqual(aligned["version"], board["version"])
+        self.assertEqual(
+            {key: aligned[key] for key in serials}, serials,
+        )
+        before["identity_board"] = board
+        rotated = rerandomize(before)
+        self.assertEqual(rotated["identity"]["manufacturer"], board["manufacturer"])
+        self.assertEqual(rotated["identity"]["product"], board["product"])
+        self.assertEqual(rotated["identity"]["baseboard_product"], board["product"])
+        self.assertEqual(rotated["identity"]["version"], board["version"])
+
 
 class HardwareTests(unittest.TestCase):
+    def test_device_identity_uses_real_class_matched_bridge_fallbacks(self):
+        memory_controller = PciDevice(
+            "00:18.0", "0500", "1022", "14e0", "Data Fabric memory controller",
+        )
+        identity = device_identity([memory_controller], "amd")
+        self.assertEqual(identity["pcibridge"], "1633")
+        self.assertEqual(identity["xhci"], "7914")
+
+        bridge = PciDevice(
+            "00:01.1", "0604", "1022", "14db", "PCIe GPP Bridge",
+        )
+        identity = device_identity([memory_controller, bridge], "amd")
+        self.assertEqual(identity["pcibridge"], "14db")
+
+    def test_older_amd_capabilities_do_not_require_missing_accelerators(self):
+        cpu = {
+            "vendor": "amd", "virtualization": "svm",
+            "x86_features": ["svm", "npt"],
+        }
+        with patch(
+            "kvm_aavm.hardware._module_parameter_enabled", return_value=True,
+        ):
+            capabilities = kvm_capabilities(cpu)
+        self.assertTrue(capabilities["nested"])
+        self.assertTrue(capabilities["npt"])
+        self.assertFalse(capabilities["avic"])
+        self.assertTrue(capabilities["gmet"])
+
     def test_layout_reserves_two_smt_cores_and_pairs_guest_threads(self):
         info = {
             "threads_per_core": 2,
@@ -65,8 +142,91 @@ class HardwareTests(unittest.TestCase):
         self.assertEqual(layout["vcpu_pins"], [2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15])
         self.assertEqual(layout["emulator_cpus"], [0, 1, 8, 9])
 
+    def test_amd_native_cpuid_layout_aligns_vcpu_and_physical_apic_ids(self):
+        info = {
+            "vendor": "amd",
+            "threads_per_core": 2,
+            "thread_siblings": [
+                [0, 8], [1, 9], [2, 10], [3, 11],
+                [4, 12], [5, 13], [6, 14], [7, 15],
+            ],
+            "native_apic_ids": {
+                "0": 0, "8": 1, "1": 2, "9": 3,
+                "2": 4, "10": 5, "3": 6, "11": 7,
+                "4": 8, "12": 9, "5": 10, "13": 11,
+                "6": 12, "14": 13, "7": 14, "15": 15,
+            },
+        }
+        layout = vm_cpu_layout(info, 12)
+        self.assertEqual(
+            layout["vcpu_pins"],
+            [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13],
+        )
+        self.assertEqual(layout["emulator_cpus"], [6, 7, 14, 15])
+
+    def test_amd_full_native_cpuid_layout_shares_final_two_host_cores(self):
+        info = {
+            "vendor": "amd",
+            "threads_per_core": 2,
+            "thread_siblings": [
+                [0, 8], [1, 9], [2, 10], [3, 11],
+                [4, 12], [5, 13], [6, 14], [7, 15],
+            ],
+            "native_apic_ids": {
+                "0": 0, "8": 1, "1": 2, "9": 3,
+                "2": 4, "10": 5, "3": 6, "11": 7,
+                "4": 8, "12": 9, "5": 10, "13": 11,
+                "6": 12, "14": 13, "7": 14, "15": 15,
+            },
+        }
+        layout = vm_cpu_layout(info, 16, shared_emulator_cores=2)
+        self.assertEqual(
+            layout["vcpu_pins"],
+            [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15],
+        )
+        self.assertEqual(layout["emulator_cpus"], [6, 7, 14, 15])
+        self.assertTrue(layout["emulator_shared"])
 
 class XmlTests(unittest.TestCase):
+    def test_older_amd_without_topoext_keeps_same_host_passthrough_logic(self):
+        value = profile()
+        value["host"]["cpu"]["x86_features"] = ["svm", "npt"]
+        root = ET.fromstring(build_domain_xml(value, stage="final"))
+        self.assertIsNone(root.find("./cpu/feature[@name='topoext']"))
+        self.assertEqual(root.find("./cpu").get("mode"), "host-passthrough")
+
+    def test_tpm_backends_use_supported_libvirt_xml(self):
+        emulated = profile()
+        emulated["tpm"] = {"mode": "emulator", "model": "tpm-crb"}
+        root = ET.fromstring(build_domain_xml(emulated, stage="final"))
+        self.assertIsNotNone(
+            root.find("./devices/tpm[@model='tpm-crb']/backend"
+                      "[@type='emulator'][@version='2.0'][@persistent_state='yes']")
+        )
+        self.assertEqual(validate_required(ET.tostring(root, encoding="unicode")), [])
+
+    def test_amd_ftpm_profile_requires_crb_and_is_persisted_in_metadata(self):
+        value = profile()
+        value["tpm"] = {
+            "mode": "emulator", "model": "tpm-crb", "version": "2.0",
+            "profile": "amd-ftpm",
+        }
+        root = ET.fromstring(build_domain_xml(value, stage="final"))
+        stage = root.find("./metadata/{https://kvm-aavm.local/xmlns/domain/1.0}stage")
+        self.assertEqual(stage.get("tpm-profile"), "amd-ftpm")
+        self.assertIsNotNone(root.find("./devices/tpm[@model='tpm-crb']/backend[@type='emulator']"))
+        self.assertEqual(validate_required(ET.tostring(root, encoding="unicode")), [])
+
+        value["tpm"]["model"] = "tpm-tis"
+        with self.assertRaisesRegex(AppError, "requires the tpm-crb"):
+            build_domain_xml(value, stage="final")
+
+    def test_unsupported_tpm_mode_is_rejected(self):
+        value = profile()
+        value["tpm"] = {"mode": "passthrough", "device": "/dev/tpm0"}
+        with self.assertRaisesRegex(AppError, "Unsupported TPM mode"):
+            build_domain_xml(value, stage="final")
+
     def test_smt_topology_and_cpu_pinning_are_emitted(self):
         value = profile()
         value["resources"].update({
@@ -85,6 +245,36 @@ class XmlTests(unittest.TestCase):
         self.assertEqual(pins[0].attrib, {"vcpu": "0", "cpuset": "2"})
         self.assertEqual(pins[1].attrib, {"vcpu": "1", "cpuset": "10"})
         self.assertEqual(root.find("./cputune/emulatorpin").get("cpuset"), "0,1,8,9")
+
+    def test_svme_gated_native_cpuid_accepts_contiguous_native_apic_subset(self):
+        value = profile()
+        value["host"]["cpu"].update({
+            "logical_cpus": 4,
+            "native_apic_ids": {"0": 0, "2": 1, "1": 2, "3": 3},
+        })
+        value["resources"].update({
+            "vcpus": 4,
+            "threads_per_core": 2,
+            "cpuid_policy": "svme-gated-native",
+            "cpu_pinning": {
+                "vcpus": [0, 2, 1, 3],
+                "emulator": [1, 3],
+            },
+        })
+        root = ET.fromstring(build_domain_xml(value, stage="final"))
+        stage = root.find(f"./metadata/{{{AAVM_NS}}}stage")
+        self.assertEqual(stage.get("cpuid-policy"), "svme-gated-native")
+        self.assertEqual(root.findtext("./vcpu"), "4")
+        value["resources"]["vcpus"] = 2
+        value["resources"]["cpu_pinning"] = {
+            "vcpus": [0, 2],
+            "emulator": [1, 3],
+        }
+        subset = ET.fromstring(build_domain_xml(value, stage="final"))
+        self.assertEqual(subset.findtext("./vcpu"), "2")
+        value["resources"]["cpu_pinning"]["vcpus"] = [0, 1]
+        with self.assertRaisesRegex(AppError, "same native APIC ID"):
+            build_domain_xml(value, stage="final")
 
     def test_required_vtd_xml_is_delayed_until_patched_stage(self):
         xml = build_domain_xml(profile())
@@ -220,6 +410,82 @@ class XmlTests(unittest.TestCase):
         )
         self.assertEqual(stage.get("guest-core-isolation"), "true")
         self.assertEqual(validate_required(ET.tostring(root, encoding="unicode")), [])
+
+    def test_hvci_nested_hyperv_uses_amd_gmet_only_when_kvm_supports_it(self):
+        value = profile()
+        value["guest_secure_boot"] = True
+        value["guest_core_isolation"] = True
+        value["guest_hyperv_enlightenments"] = True
+        value["host"]["kvm"] = {
+            "nested": True, "npt": True, "avic": True, "gmet": True,
+        }
+        root = ET.fromstring(build_domain_xml(value, stage="final"))
+        for feature in (
+            "relaxed", "vapic", "spinlocks", "vpindex", "runtime", "synic",
+            "stimer", "frequencies", "tlbflush", "ipi", "avic",
+        ):
+            self.assertIsNotNone(
+                root.find(f"./features/hyperv/{feature}[@state='on']"), feature,
+            )
+        self.assertIsNotNone(
+            root.find("./features/hyperv/spinlocks[@state='on'][@retries='8191']"),
+        )
+        self.assertIsNotNone(
+            root.find("./features/hyperv/stimer/direct[@state='on']"),
+        )
+        self.assertIsNotNone(root.find("./clock/timer[@name='hypervclock'][@present='yes']"))
+        args = {
+            item.get("value") for item in root.findall(
+                "./{http://libvirt.org/schemas/domain/qemu/1.0}commandline/"
+                "{http://libvirt.org/schemas/domain/qemu/1.0}arg"
+            )
+        }
+        self.assertTrue({
+            "host-x86_64-cpu.gmet=on",
+            "host-x86_64-cpu.hv-emsr-bitmap=on",
+            "host-x86_64-cpu.hv-tlbflush-ext=on",
+            "host-x86_64-cpu.hv-tlbflush-direct=on",
+            "host-x86_64-cpu.cet-ss=off",
+        }.issubset(args))
+        self.assertEqual(validate_required(ET.tostring(root, encoding="unicode")), [])
+
+    def test_hvci_nested_hyperv_omits_amd_globals_without_full_kvm_capabilities(self):
+        value = profile()
+        value["guest_secure_boot"] = True
+        value["guest_core_isolation"] = True
+        value["guest_hyperv_enlightenments"] = True
+        value["host"]["kvm"] = {
+            "nested": True, "npt": True, "avic": True, "gmet": False,
+        }
+        root = ET.fromstring(build_domain_xml(value, stage="final"))
+        self.assertIsNotNone(root.find("./features/hyperv/stimer/direct[@state='on']"))
+        self.assertIsNotNone(root.find("./features/hyperv/avic[@state='on']"))
+        args = {
+            item.get("value") for item in root.findall(
+                "./{http://libvirt.org/schemas/domain/qemu/1.0}commandline/"
+                "{http://libvirt.org/schemas/domain/qemu/1.0}arg"
+            )
+        }
+        self.assertNotIn("host-x86_64-cpu.gmet=on", args)
+        self.assertIn("host-x86_64-cpu.cet-ss=off", args)
+        stage = root.find("./metadata/{https://kvm-aavm.local/xmlns/domain/1.0}stage")
+        self.assertEqual(stage.get("guest-gmet"), "false")
+        self.assertEqual(validate_required(ET.tostring(root, encoding="unicode")), [])
+
+    def test_2m_hugepages_are_optional_and_validated(self):
+        value = profile()
+        value["resources"]["hugepages_2m"] = True
+        root = ET.fromstring(build_domain_xml(value, stage="final"))
+        self.assertIsNotNone(
+            root.find("./memoryBacking/hugepages/page[@size='2048'][@unit='KiB']"),
+        )
+        self.assertIsNotNone(root.find("./memoryBacking/nosharepages"))
+        self.assertEqual(validate_required(ET.tostring(root, encoding="unicode")), [])
+        root.find("./memoryBacking").remove(root.find("./memoryBacking/nosharepages"))
+        self.assertIn(
+            "Hugepage memory must disable KSM sharing",
+            validate_required(ET.tostring(root, encoding="unicode")),
+        )
 
     def test_required_nested_virtualization_without_vbs_metadata_is_rejected(self):
         root = ET.fromstring(build_domain_xml(profile(), stage="final"))
@@ -452,6 +718,23 @@ class XmlTests(unittest.TestCase):
         self.assertIsNone(audio_root.find(
             "./devices/controller[@type='pci'][@model='pcie-to-pci-bridge']"
         ))
+        managed_root_ports = [
+            controller
+            for controller in audio_root.findall(
+                "./devices/controller[@type='pci'][@model='pcie-root-port']"
+            )
+            if (
+                controller.find("alias") is not None
+                and controller.find("alias").get("name", "").startswith(
+                    "ua-kvm-aavm-pcie-"
+                )
+            )
+        ]
+        self.assertTrue(managed_root_ports)
+        self.assertTrue(all(
+            controller.find("target").get("hotplug") == "off"
+            for controller in managed_root_ports
+        ))
         self.assertIsNotNone(audio_root.find(
             "./devices/iommu[@model='intel']/driver"
             "[@intremap='off'][@caching_mode='on']"
@@ -469,7 +752,9 @@ class XmlTests(unittest.TestCase):
         self.assertIsNone(root.find("./devices/interface"))
         self.assertIsNone(root.find("./devices/audio"))
         self.assertIsNone(root.find("./devices/sound"))
-        self.assertIsNone(root.find("./devices/controller[@type='usb']"))
+        self.assertIsNotNone(
+            root.find("./devices/controller[@type='usb'][@model='none']")
+        )
         self.assertIsNotNone(root.find("./devices/controller[@type='pci']"))
         self.assertIsNotNone(root.find("./devices/controller[@type='sata']"))
         self.assertIsNotNone(root.find("./devices/disk[@device='disk']"))
@@ -526,6 +811,131 @@ class XmlTests(unittest.TestCase):
 
 
 class OfflineTests(unittest.TestCase):
+    def test_offline_install_temporarily_releases_only_managed_holds(self):
+        runner = Mock()
+        runner.run.return_value = Mock(
+            stdout="linux-headers-generic\ncustom-kernel\n",
+        )
+        with patch.object(offline, "load_host_state", return_value={
+            "update_protection_enabled": True,
+            "update_protection_managed_holds": ["linux-headers-generic"],
+        }):
+            released = offline._release_managed_update_holds(runner)
+        self.assertEqual(released, ["linux-headers-generic"])
+        runner.run.assert_any_call(
+            ["apt-mark", "unhold", "linux-headers-generic"],
+        )
+        self.assertNotIn("custom-kernel", str(runner.run.call_args_list))
+
+        offline._restore_managed_update_holds(runner, released)
+        runner.run.assert_any_call(
+            ["apt-mark", "hold", "linux-headers-generic"],
+        )
+
+    def test_deb_resolver_uses_repository_version_not_local_kernel_version(self):
+        resolver = runpy.run_path(
+            str(Path(__file__).parents[1] / "tools" / "resolve_debs.py"),
+            run_name="resolve_debs_test",
+        )
+        runner = Mock(side_effect=[
+            Mock(stdout="linux-libc-dev\n"),
+            Mock(stdout=(
+                "linux-libc-dev | 6.8.0-138.138 | "
+                "http://archive.example noble-updates/main amd64 Packages\n"
+            )),
+        ])
+        with patch.object(resolver["subprocess"], "run", runner):
+            self.assertEqual(
+                resolver["dependencies"](["linux-libc-dev"]),
+                ["linux-libc-dev=6.8.0-138.138"],
+            )
+
+    def test_deb_pruner_reads_unlabelled_control_fields(self):
+        result = Mock(stdout="curl\n8.5.0-2ubuntu10.13\namd64\n")
+        with patch.object(
+            prune_superseded_debs.subprocess, "run", return_value=result,
+        ) as run:
+            self.assertEqual(
+                prune_superseded_debs.metadata(Path("curl.deb")),
+                ("curl", "8.5.0-2ubuntu10.13", "amd64"),
+            )
+        self.assertIn("--showformat=${Package}\\n${Version}\\n${Architecture}\\n", run.call_args.args[0])
+
+    def test_deb_pruner_keeps_newest_debian_version(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            old = directory / "curl_old_amd64.deb"
+            new = directory / "curl_new_amd64.deb"
+            old.touch()
+            new.touch()
+
+            def package_metadata(path):
+                version = "8.5.0-2ubuntu10.11" if path == old else "8.5.0-2ubuntu10.13"
+                return "curl", version, "amd64"
+
+            with patch.object(
+                prune_superseded_debs, "metadata", side_effect=package_metadata,
+            ):
+                removed = prune_superseded_debs.prune(directory)
+            self.assertEqual(removed, [old])
+            self.assertFalse(old.exists())
+            self.assertTrue(new.exists())
+
+    def test_deb_pruner_removes_duplicate_same_version_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            first = directory / "curl_a_amd64.deb"
+            duplicate = directory / "curl_b_amd64.deb"
+            first.touch()
+            duplicate.touch()
+            with patch.object(
+                prune_superseded_debs,
+                "metadata",
+                return_value=("curl", "8.5.0-2ubuntu10.13", "amd64"),
+            ):
+                removed = prune_superseded_debs.prune(directory)
+            self.assertEqual(removed, [duplicate])
+            self.assertTrue(first.exists())
+            self.assertFalse(duplicate.exists())
+
+    def test_offline_bundle_builder_includes_libtpms(self):
+        script = (
+            Path(__file__).parents[1] / "tools" / "prepare_offline_rootless.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("swtpm swtpm-tools libtpms0", script)
+        self.assertIn('prune_superseded_debs.py" "$DEB_DIR"', script)
+
+    def test_amd_swtpm_runtime_profile_preserves_unrelated_settings(self):
+        setup = offline._replace_managed_swtpm_setup(
+            "# local setting\nactive_pcr_banks = sha256\ncreate_certs_tool = /custom/tool\n"
+        )
+        self.assertIn("create_certs_tool = /custom/tool", setup)
+        self.assertIn("active_pcr_banks = sha1,sha256", setup)
+        self.assertNotIn("active_pcr_banks = sha256", setup)
+
+        localca = offline._replace_managed_localca_options(
+            "--platform-manufacturer Fedora\n--platform-model QEMU\n--allow-signing\n"
+        )
+        self.assertIn("--allow-signing", localca)
+        self.assertIn("--platform-manufacturer AMD", localca)
+        self.assertIn("--platform-version 2.0", localca)
+        self.assertIn("--platform-model fTPM", localca)
+        self.assertNotIn("Fedora", localca)
+        self.assertNotIn("QEMU", localca)
+
+    def test_host_tpm_pcr_banks_fall_back_when_no_tpm_is_visible(self):
+        with patch.object(offline, "TPM_SYSFS", Path("/tmp/no-such-tpm")):
+            self.assertEqual(offline._host_tpm_pcr_banks(), "sha1,sha256")
+
+    def test_host_tpm_pcr_banks_follow_active_sysfs_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "pcr-sha256").mkdir()
+            (root / "pcr-sha1").mkdir()
+            (root / "pcr-md5").mkdir()
+            with patch.object(offline, "TPM_SYSFS", root):
+                self.assertEqual(offline._host_tpm_pcr_banks(), "sha1,sha256")
+
     def test_local_apt_acquires_debs_instead_of_passing_relative_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
@@ -538,7 +948,9 @@ class OfflineTests(unittest.TestCase):
                 "Filename: example_1_amd64.deb\n\n",
                 encoding="utf-8",
             )
-            (bundle / "roots.txt").write_text("example\nopenssh-server\n", encoding="utf-8")
+            (bundle / "roots.txt").write_text(
+                "example\nlibtpms0\nopenssh-server\n", encoding="utf-8",
+            )
 
             runner = Mock()
 
@@ -563,6 +975,9 @@ class OfflineTests(unittest.TestCase):
             with patch.object(offline, "OFFLINE_DIR", bundle), \
                     patch.object(offline, "require_root"), \
                     patch.object(offline, "validate", return_value=[]), \
+                    patch.object(offline, "load_host_state", return_value={}), \
+                    patch.object(offline, "_install_amd_ftpm_libtpms"), \
+                    patch.object(offline, "configure_amd_ftpm_swtpm"), \
                     patch.object(offline.os, "chown"), \
                     patch.object(offline, "update_host_state"):
                 offline.install_packages(runner)
@@ -570,13 +985,97 @@ class OfflineTests(unittest.TestCase):
             install = runner.run.call_args_list[1].args[0]
             self.assertNotIn("--no-download", install)
             self.assertTrue(any(value.startswith("Dir::Cache::archives=") for value in install))
-            self.assertEqual(install[-2:], ["example", "openssh-server"])
+            self.assertEqual(install[-3:], ["example", "libtpms0", "openssh-server"])
             runner.run.assert_any_call(
                 ["systemctl", "enable", "--now", "ssh.service"]
             )
 
 
 class BuildTests(unittest.TestCase):
+    def test_ovmf_build_keeps_tpm2_measured_boot_and_tcg2_event_log(self):
+        project = Path(__file__).parents[1]
+        script = (project / "ovmfpatch.sh").read_text(encoding="utf-8")
+        for flag in ("-D SECURE_BOOT_ENABLE", "-D SMM_REQUIRE", "-D TPM2_ENABLE"):
+            self.assertIn(flag, script)
+        _validate_ovmf_measured_boot(project / "offline/sources/edk2")
+
+    def test_ovmf_firmware_identity_rejects_generic_defaults(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ovmf = Path(temporary) / "ovmf"
+            declarations = ovmf / "MdeModulePkg"
+            declarations.mkdir(parents=True)
+            target = declarations / "MdeModulePkg.dec"
+            target.write_text(
+                'PcdFirmwareVendor|L"OVMF"|VOID*|0x1\n'
+                'PcdFirmwareVersionString|L"1686"|VOID*|0x2\n'
+                'PcdFirmwareReleaseDateString|L"06/25/2026"|VOID*|0x3\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AppError, "EDK2/OVMF"):
+                _validate_ovmf_firmware_identity(ovmf)
+
+            target.write_text(
+                'PcdFirmwareVendor|L"American Megatrends Inc."|VOID*|0x1\n'
+                'PcdFirmwareVersionString|L""|VOID*|0x2\n'
+                'PcdFirmwareReleaseDateString|L"06/25/2026"|VOID*|0x3\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AppError, "generic 440"):
+                _validate_ovmf_firmware_identity(ovmf)
+
+    def test_ovmf_identity_replacements_escape_host_dmi_values(self):
+        source = (Path(__file__).parents[1] / "ovmfpatch.sh").read_text(
+            encoding="utf-8",
+        )
+        self.assertIn("escape_sed_replacement()", source)
+        self.assertIn(
+            'firmware_vendor_sed="$(escape_sed_replacement "$firmware_vendor")"',
+            source,
+        )
+        self.assertIn(
+            'hsti_platform_sed="$(escape_sed_replacement "$hsti_platform")"',
+            source,
+        )
+        self.assertIn('s|OVMF Platform Configuration|${hsti_platform_sed}', source)
+        self.assertNotIn(
+            's/OVMF Platform Configuration/${hsti_platform}', source,
+        )
+
+    def test_hpet_firmware_hardening_uses_reverse_comparison(self):
+        source = (Path(__file__).parents[1] / "qemupatch.sh").read_text(encoding="utf-8")
+        self.assertIn("aml_lless(aml_int(41666666), period)", source)
+        self.assertIn("Unsupported QEMU source: HPET period validation was not found", source)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            qemu = Path(temporary) / "qemu"
+            acpi = qemu / "hw/i386/acpi-build.c"
+            acpi.parent.mkdir(parents=True)
+            acpi.write_text("aml_lless(aml_int(41666666), period)\n", encoding="utf-8")
+            _validate_qemu_firmware_hardening(qemu)
+            acpi.write_text("aml_lgreater(period, aml_int(41666666))\n", encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "HPET"):
+                _validate_qemu_firmware_hardening(qemu)
+
+    def test_qemu_kvm_hypercall_hardening_disables_rewrite_quirk(self):
+        source = (Path(__file__).parents[1] / "qemupatch.sh").read_text(encoding="utf-8")
+        self.assertIn("KVM-AAVM: disable KVM hypercall rewrite quirk.", source)
+        self.assertIn("sed -n '/^int kvm_arch_init(/,/^}$/p'", source)
+        self.assertIn("sed -i '/^int kvm_arch_init(/,/^}$/ {", source)
+        with tempfile.TemporaryDirectory() as temporary:
+            qemu = Path(temporary) / "qemu"
+            kvm = qemu / "target/i386/kvm/kvm.c"
+            kvm.parent.mkdir(parents=True)
+            kvm.write_text(
+                "/* KVM-AAVM: disable KVM hypercall rewrite quirk. */\n"
+                "ret = kvm_vm_enable_cap(s, KVM_CAP_DISABLE_QUIRKS2, 0,\n"
+                "                         KVM_X86_QUIRK_FIX_HYPERCALL_INSN);\n",
+                encoding="utf-8",
+            )
+            _validate_qemu_kvm_hypercall_hardening(qemu)
+            kvm.write_text("int unchanged;\n", encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "hypercall"):
+                _validate_qemu_kvm_hypercall_hardening(qemu)
+
     def test_q35_dmar_ioapic_uses_root_bus_requester_id(self):
         source = (Path(__file__).parents[1] / "qemupatch.sh").read_text(encoding="utf-8")
         self.assertIn("Q35_PSEUDO_BUS_PLATFORM         (0x00)", source)
@@ -629,6 +1128,30 @@ class BuildTests(unittest.TestCase):
         )
         self.assertIn("./configure --target-list=x86_64-softmmu --disable-rust", adapted)
         self.assertIn("cp -a qemubackup/. qemu", adapted)
+
+    def test_qemu_pci_identity_uses_host_queries_and_matching_device_classes(self):
+        source = (Path(__file__).parents[1] / "qemupatch.sh").read_text(
+            encoding="utf-8",
+        )
+        self.assertNotIn("cpu_vendor:1", source)
+        self.assertNotRegex(source, r"printf[^\n]+xhci")
+        self.assertIn(
+            's/XHCI        0x000d/XHCI        0x$xhci_1022/', source,
+        )
+        self.assertIn(
+            's/PCIE_BRIDGE 0x000e/PCIE_BRIDGE 0x$pcibridge_1022/', source,
+        )
+        self.assertIn(
+            'PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_1022/', source,
+        )
+        self.assertIn(
+            'edk2bridge_1022=\\"$hostbridge_1022\\"', source,
+        )
+        ovmf = (Path(__file__).parents[1] / "ovmfpatch.sh").read_text(
+            encoding="utf-8",
+        )
+        self.assertNotIn("cpu_vendor:1", ovmf)
+        self.assertIn('if [[ "$cpu_vendor" == "AuthenticAMD" ]]', ovmf)
 
     def test_hardware_name_is_shell_safe_and_sed_escaped_at_runtime(self):
         hardware = {
@@ -696,6 +1219,19 @@ class PassthroughTests(unittest.TestCase):
         self.assertIsNone(usb.find("./source/address"))
         self.assertIsNone(root.find("./devices/interface[@type='network']"))
         self.assertIsNotNone(root.find("./devices/graphics"))
+
+    def test_standalone_nonzero_pci_function_is_guest_function_zero(self):
+        value = profile()
+        value["passthrough"] = {
+            "mode": "manual",
+            "pci": ["0c:00.4"],
+            "gpu_pci": [],
+            "usb": [],
+        }
+        root = ET.fromstring(build_domain_xml(value, stage="final"))
+        hostdev = root.find("./devices/hostdev[@type='pci']")
+        self.assertEqual(hostdev.find("./source/address").get("function"), "0x4")
+        self.assertEqual(hostdev.find("./address").get("function"), "0x0")
 
     def test_minimal_passthrough_update_keeps_network_pruned_and_adds_usb_controller(self):
         value = profile()
@@ -790,17 +1326,48 @@ class HookTests(unittest.TestCase):
             self.assertIn("release:end", script_text)
             self.assertNotIn("kvm_aavm_oneshot", script_text)
             self.assertNotIn("systemctl reboot", script_text)
-            self.assertIn("nvidia_drm nvidia_modeset nvidia_uvm nvidia", script_text)
+            self.assertIn(
+                "unload_gpu_modules nvidia_drm nvidia_modeset nvidia_uvm",
+                script_text,
+            )
+            self.assertIn("unload_gpu_modules nvidia", script_text)
             self.assertIn("driver_override", script_text)
             self.assertIn("echo vfio-pci", script_text)
             self.assertIn("loginctl terminate-seat seat0", script_text)
             self.assertIn("for attempt in {1..40}", script_text)
             self.assertIn('[[ -d "/sys/module/$module" ]] || continue', script_text)
-            prepare_offset = script_text.index("prepare:begin)")
-            self.assertLess(
-                script_text.index('> "$dev/driver/unbind"', prepare_offset),
-                script_text.index('for attempt in {1..40}', prepare_offset),
+            self.assertIn(
+                "timeout --signal=TERM --kill-after=2s 5s modprobe -r",
+                script_text,
             )
+            self.assertIn("Timed out unloading GPU module $module", script_text)
+            self.assertIn(
+                "timeout --signal=TERM --kill-after=2s 15s",
+                script_text,
+            )
+            self.assertIn(
+                '[[ "$(cat /sys/module/nvidia/refcnt)" != 0 ]]',
+                script_text,
+            )
+            self.assertIn("NVIDIA core module is still referenced", script_text)
+            prepare_offset = script_text.index("prepare:begin)")
+            client_unload_offset = script_text.index(
+                "unload_gpu_modules nvidia_drm nvidia_modeset nvidia_uvm",
+                prepare_offset,
+            )
+            unbind_offset = script_text.index(
+                "unbind_pci_driver 0000:01:00.0",
+                prepare_offset,
+            )
+            core_unload_offset = script_text.index(
+                "unload_gpu_modules nvidia",
+                client_unload_offset + 1,
+            )
+            self.assertLess(
+                client_unload_offset,
+                unbind_offset,
+            )
+            self.assertLess(unbind_offset, core_unload_offset)
             self.assertIn("GPU device unbind failed", script_text)
             self.assertIn('echo bus > "$dev/reset_method"', script_text)
             self.assertIn('echo 1 > "$dev/reset"', script_text)
@@ -809,12 +1376,26 @@ class HookTests(unittest.TestCase):
             self.assertIn("systemctl daemon-reload", script_text)
             self.assertIn("reactivate_graphical_seat", script_text)
             self.assertIn("deactivate_graphical_outputs", script_text)
+            self.assertIn("trap rollback_handoff EXIT", script_text)
+            self.assertIn(
+                "GPU handoff failed; running automatic host display rollback",
+                script_text,
+            )
+            self.assertIn(
+                "bounded 30s systemctl stop display-manager.service",
+                script_text,
+            )
+            self.assertIn(
+                "bounded 15s loginctl terminate-seat seat0",
+                script_text,
+            )
+            self.assertIn("handoff_committed=1", script_text)
             self.assertLess(
                 script_text.index(
-                    "deactivate_graphical_outputs\n    systemctl stop display-manager.service",
+                    "deactivate_graphical_outputs\n    bounded 30s systemctl stop display-manager.service",
                     prepare_offset,
                 ),
-                script_text.index('> "$dev/driver/unbind"', prepare_offset),
+                unbind_offset,
             )
             self.assertIn('xrandr --output "$output" --off', script_text)
             self.assertIn('xrandr --output "$output" --preferred', script_text)
@@ -888,6 +1469,359 @@ class HookTests(unittest.TestCase):
 
 
 class VmTests(unittest.TestCase):
+    def test_devirtualized_secure_boot_pins_host_board_identity(self):
+        runner = Mock()
+        value = profile()
+        board = {
+            "manufacturer": "ASUSTeK COMPUTER INC.",
+            "product": "TUF GAMING B850-PLUS WIFI",
+            "version": "Rev 1.xx",
+        }
+        firmware = {
+            "vendor": "American Megatrends Inc.",
+            "version": "1686",
+            "date": "06/25/2026",
+        }
+        with patch.object(vm, "require_root"), \
+                patch.object(vm, "vm_lock", return_value=nullcontext()), \
+                patch.object(vm, "load_profile", return_value=value), \
+                patch.object(vm, "_refresh_profile_host_capabilities"), \
+                patch.object(vm, "_ensure_inactive"), \
+                patch.object(vm, "_dump_xml", return_value="<domain />"), \
+                patch.object(vm, "_backup_xml"), \
+                patch.object(vm, "_remember_existing_tpm"), \
+                patch.object(vm, "_host_board_identity", return_value=board), \
+                patch.object(vm, "_host_firmware_identity", return_value=firmware), \
+                patch.object(vm, "_set_guest_secure_boot_varstore", return_value=None), \
+                patch.object(vm, "build_domain_xml", return_value="<domain />") as build, \
+                patch.object(vm, "_replace_definition"), \
+                patch.object(vm, "save_profile"), \
+                patch.object(vm, "atomic_write"):
+            vm.enable_devirtualized(
+                "test-vm", runner, guest_secure_boot=True,
+            )
+        configured = build.call_args.args[0]
+        self.assertEqual(configured["identity_board"], board)
+        self.assertEqual(configured["identity"]["manufacturer"], board["manufacturer"])
+        self.assertEqual(configured["identity"]["product"], board["product"])
+        self.assertEqual(configured["identity"]["baseboard_product"], board["product"])
+        self.assertEqual(configured["identity_firmware"], firmware)
+
+    def test_existing_emulator_tpm_is_preserved_for_future_rebuilds(self):
+        value = profile()
+        root = ET.fromstring(build_domain_xml(value, stage="final"))
+        devices = root.find("devices")
+        tpm = ET.SubElement(devices, "tpm", {"model": "tpm-crb"})
+        ET.SubElement(
+            tpm, "backend",
+            {"type": "emulator", "version": "2.0", "persistent_state": "yes"},
+        )
+        vm._remember_existing_tpm(value, ET.tostring(root, encoding="unicode"))
+        self.assertEqual(value["tpm"], {
+            "mode": "emulator", "model": "tpm-crb", "version": "2.0",
+        })
+        rebuilt = ET.fromstring(build_domain_xml(value, stage="final"))
+        self.assertIsNotNone(
+            rebuilt.find("./devices/tpm[@model='tpm-crb']/backend[@type='emulator']")
+        )
+
+    def test_tpm_config_from_xml_reads_manual_emulator(self):
+        xml = (
+            "<domain><devices><tpm model='tpm-crb'><backend "
+            "type='emulator' version='2.0' persistent_state='yes'/>"
+            "</tpm></devices></domain>"
+        )
+        self.assertEqual(vm.tpm_config_from_xml(xml), {
+            "mode": "emulator", "model": "tpm-crb", "version": "2.0",
+        })
+
+    def test_configure_tpm_uses_persistent_emulator(self):
+        runner = Mock()
+        value = profile()
+        old_xml = build_domain_xml(value, stage="final")
+        with patch.object(vm, "require_root"), \
+                patch.object(vm, "vm_lock", return_value=nullcontext()), \
+                patch.object(vm, "load_profile", return_value=value), \
+                patch.object(vm, "_ensure_inactive"), \
+                patch.object(vm, "_dump_xml", return_value=old_xml), \
+                patch.object(vm, "_backup_xml"), \
+                patch.object(vm, "_replace_definition") as replace, \
+                patch.object(vm, "save_profile"), \
+                patch.object(vm, "atomic_write"):
+            vm.configure_tpm("test-vm", "emulator", runner)
+        self.assertEqual(value["tpm"], {
+            "mode": "emulator", "model": "tpm-crb", "version": "2.0",
+        })
+        self.assertIn("<tpm model=\"tpm-crb\">", replace.call_args.args[1])
+
+    def test_configure_tpm_amd_profile_requires_patched_libtpms(self):
+        runner = Mock()
+        value = profile()
+        old_xml = build_domain_xml(value, stage="final")
+        with patch.object(vm, "require_root"), \
+                patch.object(vm, "vm_lock", return_value=nullcontext()), \
+                patch.object(vm, "load_profile", return_value=value), \
+                patch.object(vm, "_ensure_inactive"), \
+                patch.object(vm, "_dump_xml", return_value=old_xml), \
+                patch.object(vm, "_backup_xml"), \
+                patch.object(vm, "_require_amd_ftpm_libtpms") as require_profile, \
+                patch.object(vm, "_replace_definition"), \
+                patch.object(vm, "save_profile"), \
+                patch.object(vm, "atomic_write"):
+            vm.configure_tpm("test-vm", "amd-ftpm", runner)
+        require_profile.assert_called_once_with(value, runner)
+        self.assertEqual(value["tpm"], {
+            "mode": "emulator", "model": "tpm-crb", "version": "2.0",
+            "profile": "amd-ftpm",
+        })
+
+    def test_recreate_tpm_retires_state_after_creating_a_backup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "libvirt-swtpm"
+            backup_root = root / "backups"
+            value = profile()
+            value["tpm"] = {
+                "mode": "emulator", "model": "tpm-crb", "version": "2.0",
+                "profile": "amd-ftpm",
+            }
+            xml = build_domain_xml(value, stage="final")
+            uuid = ET.fromstring(xml).findtext("uuid")
+            active = state_root / uuid / "tpm2"
+            active.mkdir(parents=True)
+            (active / "tpm2-00.permall").write_bytes(b"old-tpm-state")
+            runner = Mock()
+            with patch.object(vm, "require_root"), \
+                    patch.object(vm, "vm_lock", return_value=nullcontext()), \
+                    patch.object(vm, "load_profile", return_value=value), \
+                    patch.object(vm, "_ensure_inactive"), \
+                    patch.object(vm, "_dump_xml", return_value=xml), \
+                    patch.object(vm, "_backup_xml"), \
+                    patch.object(vm, "_require_amd_ftpm_libtpms"), \
+                    patch.object(vm, "LIBVIRT_SWTPM_DIR", state_root), \
+                    patch.object(vm, "BACKUP_DIR", backup_root):
+                backup = vm.recreate_tpm("test-vm", runner, confirmed=True)
+            self.assertIsNotNone(backup)
+            self.assertTrue((backup / "tpm2" / "tpm2-00.permall").is_file())
+            self.assertTrue((backup / "recreation.json").is_file())
+            self.assertFalse((state_root / uuid).exists())
+            retired = list(state_root.glob(f"{uuid}.kvm-aavm-retired-*"))
+            self.assertEqual(len(retired), 1)
+            self.assertTrue((retired[0] / "tpm2" / "tpm2-00.permall").is_file())
+
+    def test_recreate_tpm_requires_explicit_confirmation(self):
+        with patch.object(vm, "require_root"):
+            with self.assertRaisesRegex(AppError, "explicit confirmation"):
+                vm.recreate_tpm("test-vm", Mock())
+
+    def test_uuid_rotation_migrates_persistent_tpm_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "libvirt-swtpm"
+            value = profile()
+            value["tpm"] = {
+                "mode": "emulator", "model": "tpm-crb", "version": "2.0",
+            }
+            old_xml = build_domain_xml(value, stage="final")
+            rotated = rerandomize(value)
+            new_xml = update_identity(old_xml, rotated["identity"], 8)
+            old_uuid = ET.fromstring(old_xml).findtext("uuid")
+            new_uuid = ET.fromstring(new_xml).findtext("uuid")
+            old_state = state_root / old_uuid / "tpm2"
+            old_state.mkdir(parents=True)
+            (old_state / "tpm2-00.permall").write_bytes(b"persistent")
+
+            with patch.object(vm, "LIBVIRT_SWTPM_DIR", state_root):
+                migration = vm._migrate_tpm_state_for_uuid(old_xml, new_xml)
+                self.assertEqual(migration, (state_root / old_uuid, state_root / new_uuid))
+                self.assertFalse((state_root / old_uuid).exists())
+                self.assertTrue((state_root / new_uuid / "tpm2" / "tpm2-00.permall").is_file())
+                vm._rollback_tpm_state_migration(migration)
+                self.assertTrue((state_root / old_uuid / "tpm2" / "tpm2-00.permall").is_file())
+                self.assertFalse((state_root / new_uuid).exists())
+
+    def test_amd_ftpm_libtpms_rejects_unmanaged_package(self):
+        runner = Mock()
+        runner.run.return_value = Mock(returncode=0, stdout="0.9.3-0ubuntu4", stderr="")
+        with self.assertRaisesRegex(AppError, "patched libtpms0"):
+            vm._require_amd_ftpm_libtpms(profile(), runner)
+
+    def test_configure_hugepages_reserves_total_for_all_managed_vms(self):
+        runner = Mock()
+        runner.dry_run = False
+        value = profile()
+        value["resources"]["hugepages_2m"] = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vm_root = root / "vms"
+            (vm_root / "test-vm").mkdir(parents=True)
+            (vm_root / "other").mkdir()
+            (vm_root / "test-vm" / "profile.json").write_text(
+                json.dumps(value), encoding="utf-8",
+            )
+            other = profile()
+            other["name"] = "other"
+            other["resources"].update({"memory_gib": 4, "hugepages_2m": True})
+            (vm_root / "other" / "profile.json").write_text(
+                json.dumps(other), encoding="utf-8",
+            )
+            sysctl = root / "99-kvm-aavm-hugepages.conf"
+            target = (8 + 4) * 512
+            with patch.object(vm, "require_root"), \
+                    patch.object(vm, "vm_lock", return_value=nullcontext()), \
+                    patch.object(vm, "load_profile", return_value=value), \
+                    patch.object(vm, "_ensure_inactive"), \
+                    patch.object(vm, "_dump_xml", return_value=build_domain_xml(value, stage="final")), \
+                    patch.object(vm, "_backup_xml"), \
+                    patch.object(vm, "_replace_definition"), \
+                    patch.object(vm, "save_profile"), \
+                    patch.object(vm, "VM_DIR", vm_root), \
+                    patch.object(vm, "HUGEPAGES_SYSCTL", sysctl), \
+                    patch.object(vm, "HUGEPAGES_2M_SYSFS", root / "nr_hugepages"), \
+                    patch.object(vm, "_read_hugepage_count", side_effect=[0, target]), \
+                    patch.object(vm, "vm_dir", return_value=vm_root / "test-vm"):
+                vm.configure_hugepages("test-vm", True, runner)
+            self.assertTrue(value["resources"]["hugepages_2m"])
+            self.assertEqual(sysctl.read_text(encoding="utf-8").splitlines()[-1], f"vm.nr_hugepages={target}")
+            self.assertIn(
+                ["sysctl", "-w", f"vm.nr_hugepages={target}"],
+                [call.args[0] for call in runner.run.call_args_list],
+            )
+
+    def test_configure_hugepages_restores_reservation_when_xml_definition_fails(self):
+        runner = Mock()
+        runner.dry_run = False
+        value = profile()
+        previous_text = "vm.nr_hugepages=100\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vm_root = root / "vms"
+            (vm_root / "test-vm").mkdir(parents=True)
+            sysctl = root / "99-kvm-aavm-hugepages.conf"
+            sysctl.write_text(previous_text, encoding="utf-8")
+            target = 8 * 512
+            with patch.object(vm, "require_root"), \
+                    patch.object(vm, "vm_lock", return_value=nullcontext()), \
+                    patch.object(vm, "load_profile", return_value=value), \
+                    patch.object(vm, "_ensure_inactive"), \
+                    patch.object(vm, "_dump_xml", return_value=build_domain_xml(value, stage="final")), \
+                    patch.object(vm, "_backup_xml"), \
+                    patch.object(vm, "_replace_definition", side_effect=AppError("define failed")), \
+                    patch.object(vm, "save_profile"), \
+                    patch.object(vm, "VM_DIR", vm_root), \
+                    patch.object(vm, "HUGEPAGES_SYSCTL", sysctl), \
+                    patch.object(vm, "HUGEPAGES_2M_SYSFS", root / "nr_hugepages"), \
+                    patch.object(vm, "_read_hugepage_count", side_effect=[100, target]):
+                with self.assertRaisesRegex(AppError, "define failed"):
+                    vm.configure_hugepages("test-vm", True, runner)
+            self.assertFalse(value["resources"].get("hugepages_2m", False))
+            self.assertEqual(sysctl.read_text(encoding="utf-8"), previous_text)
+            self.assertIn(
+                ["sysctl", "-w", "vm.nr_hugepages=100"],
+                [call.args[0] for call in runner.run.call_args_list],
+            )
+
+    def test_rebuild_artifacts_preserves_identity_and_uses_next_generation(self):
+        runner = Mock()
+        value = profile()
+        old_xml = build_domain_xml(value, stage="final")
+        rebuilt = profile()
+        rebuilt["artifact_generation"] = 2
+        rebuilt["paths"].update({
+            "qemu": "/vm/generation-2/bin/qemu-system-x86_64",
+            "ovmf_code": "/vm/generation-2/ovmf/code.qcow2",
+            "ovmf_vars": "/vm/generation-2/ovmf/vars.qcow2",
+            "ssdt": ["/vm/generation-2/bin/ssdt1.aml", "/vm/generation-2/bin/ssdt2.aml"],
+        })
+        original_identity = value["identity"]
+        with patch.object(vm, "require_root"), \
+                patch.object(vm, "vm_lock", return_value=nullcontext()), \
+                patch.object(vm, "load_profile", return_value=value), \
+                patch.object(vm, "_ensure_inactive"), \
+                patch.object(vm, "_dump_xml", return_value=old_xml), \
+                patch.object(vm, "_backup_xml"), \
+                patch.object(vm, "build_all", return_value=rebuilt) as build, \
+                patch.object(vm, "update_artifact_paths", return_value=old_xml) as paths, \
+                patch.object(vm, "_replace_definition"), \
+                patch.object(vm, "save_profile"), \
+                patch.object(vm, "clear_pending"):
+            vm.rebuild_artifacts("test-vm", runner)
+        build.assert_called_once_with("test-vm", value, runner, generation=2)
+        paths.assert_called_once_with(old_xml, rebuilt["paths"])
+        self.assertIs(value["identity"], original_identity)
+
+    def test_cleanup_vm_artifacts_keeps_active_generation_and_removes_build_worktrees(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "artifacts" / "generation-4"
+            old = root / "artifacts" / "generation-3"
+            build_old = root / "build" / "generation-1"
+            build_active = root / "build" / "generation-4"
+            for path in (active / "bin", active / "ovmf", old, build_old, build_active):
+                path.mkdir(parents=True)
+            qemu = active / "bin/qemu-system-x86_64"
+            code = active / "ovmf/OVMF_CODE_4M.patched.qcow2"
+            vars_file = active / "ovmf/OVMF_VARS_4M.patched.qcow2"
+            ssdt1 = active / "bin/ssdt1.aml"
+            ssdt2 = active / "bin/ssdt2.aml"
+            for path in (qemu, code, vars_file, ssdt1, ssdt2):
+                path.touch()
+            value = profile()
+            value["artifact_generation"] = 4
+            value["paths"].update({
+                "qemu": str(qemu), "ovmf_code": str(code), "ovmf_vars": str(vars_file),
+                "ssdt": [str(ssdt1), str(ssdt2)],
+            })
+            runner = Mock()
+            with patch.object(vm, "require_root"), \
+                    patch.object(vm, "vm_dir", return_value=root), \
+                    patch.object(vm, "vm_lock", return_value=nullcontext()), \
+                    patch.object(vm, "load_profile", return_value=value), \
+                    patch.object(vm, "_ensure_inactive"), \
+                    patch.object(vm, "prompt_yes_no", return_value=True):
+                vm.cleanup_vm_artifacts("test-vm", runner)
+            self.assertTrue(active.is_dir())
+            self.assertFalse(old.exists())
+            self.assertFalse(build_old.exists())
+            self.assertFalse(build_active.exists())
+
+    def test_purge_vm_removes_state_backups_pending_and_disk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "vms" / "test-vm"
+            backup_root = Path(temporary) / "backups"
+            image_root = Path(temporary) / "images"
+            pending_root = Path(temporary) / "pending"
+            root.mkdir(parents=True)
+            backup_root.mkdir()
+            image_root.mkdir()
+            pending_root.mkdir()
+            disk = image_root / "test-vm.qcow2"
+            disk.touch()
+            (root / "media").mkdir()
+            (root / "profile.json").write_text(
+                json.dumps({"paths": {"disk": str(disk)}}), encoding="utf-8",
+            )
+            (backup_root / "test-vm").mkdir()
+            (backup_root / "test-vm-security-20260817").mkdir()
+            (pending_root / "test-vm.json").write_text("{}", encoding="utf-8")
+            runner = Mock()
+            runner.run.return_value = Mock(returncode=1, stdout="", stderr="")
+            with patch.object(vm, "require_root"), \
+                    patch.object(vm, "vm_dir", return_value=root), \
+                    patch.object(vm, "BACKUP_DIR", backup_root), \
+                    patch.object(vm, "VM_IMAGE_DIR", image_root), \
+                    patch.object(vm, "PENDING_DIR", pending_root), \
+                    patch.object(state, "PENDING_DIR", pending_root), \
+                    patch.object(vm, "prompt_yes_no", return_value=True), \
+                    patch.object(hooks, "remove_dynamic_hooks"), \
+                    patch.object(hooks, "remove_single_gpu_hooks"), \
+                    patch.object(hooks, "remove_performance_hook"):
+                vm.purge_vm("test-vm", runner)
+            self.assertFalse(root.exists())
+            self.assertFalse(disk.exists())
+            self.assertFalse((backup_root / "test-vm").exists())
+            self.assertFalse((backup_root / "test-vm-security-20260817").exists())
+            self.assertFalse((pending_root / "test-vm.json").exists())
+
     def test_guest_security_update_preserves_xml_only_pci_hostdev(self):
         value = profile()
         value["guest_secure_boot"] = True
@@ -945,14 +1879,167 @@ class VmTests(unittest.TestCase):
                 {"name": "KEK", "data": "kek"},
                 {"name": "db", "data": "db"},
                 {"name": "dbx", "data": "dbx"},
+                {"name": "PKDefault", "data": "host-pk"},
+                {"name": "KEKDefault", "data": "host-kek"},
+                {"name": "dbDefault", "data": "host-db"},
+                {"name": "dbxDefault", "data": "host-dbx"},
             ],
         }
         filtered = vm._filtered_secure_boot_variables(value)
         self.assertIsNotNone(filtered)
         self.assertEqual(
             {item["name"] for item in filtered["variables"]},
-            {"PK", "KEK", "db", "dbx"},
+            {
+                "PK", "KEK", "db", "dbx",
+                "PKDefault", "KEKDefault", "dbDefault", "dbxDefault",
+            },
         )
+
+    def test_secure_boot_policy_validation_rejects_unexpected_key_data(self):
+        variables = {
+            "PK": {"data": "pk"},
+            "KEK": {"data": "kek"},
+            "db": {"data": "db"},
+            "dbx": {"data": "dbx"},
+            "PKDefault": {"data": "oem-pk"},
+            "KEKDefault": {"data": "oem-kek"},
+            "dbDefault": {"data": "oem-db"},
+            "dbxDefault": {"data": "oem-dbx"},
+            "VendorKeysNv": {"data": "01"},
+            "CustomMode": {"data": "00"},
+            "SecureBootEnable": {"data": "01"},
+        }
+        reference = {name: dict(value) for name, value in variables.items()}
+        variables["db"]["data"] = "custom-db"
+        errors = vm._secure_boot_policy_errors(variables, True, reference)
+        self.assertIn("db does not match the normalized OEM/Microsoft key policy", errors)
+
+    def test_secure_boot_policy_validation_accepts_normalized_oem_microsoft_policy(self):
+        variables = {
+            "PK": {"data": "pk"},
+            "KEK": {"data": "kek"},
+            "db": {"data": "db"},
+            "dbx": {"data": "dbx"},
+            "PKDefault": {"data": "oem-pk"},
+            "KEKDefault": {"data": "oem-kek"},
+            "dbDefault": {"data": "oem-db"},
+            "dbxDefault": {"data": "oem-dbx"},
+            "VendorKeysNv": {"data": "01"},
+            "CustomMode": {"data": "00"},
+            "SecureBootEnable": {"data": "01"},
+        }
+        self.assertEqual(vm._secure_boot_policy_errors(variables, True, variables), [])
+
+    def test_host_secure_boot_policy_mirrors_active_and_preserves_factory_databases(self):
+        signature_type = bytes.fromhex("a1" * 16)
+
+        def database(*entries: bytes) -> str:
+            signature_size = 16 + len(entries[0])
+            body = b"".join(bytes([index]) * 16 + entry for index, entry in enumerate(entries, 1))
+            return (
+                signature_type
+                + struct.pack("<III", 28 + len(body), 0, signature_size)
+                + body
+            ).hex()
+
+        template = {
+            name: {"name": name, "guid": "template", "attr": 39, "data": "template"}
+            for name in (*vm.SECURE_BOOT_ACTIVE_NAMES, "VendorKeysNv", "CustomMode")
+        }
+        host = {
+            "PK": {"name": "PK", "data": "active-pk"},
+            "KEK": {"name": "KEK", "data": database(b"Microsoft Corporation active KEK")},
+            "db": {"name": "db", "data": database(b"Microsoft Corporation active UEFI CA")},
+            "dbx": {"name": "dbx", "data": "active-revocation"},
+            "PKDefault": {"name": "PKDefault", "data": "a1"},
+            "KEKDefault": {"name": "KEKDefault", "data": database(b"Microsoft Corporation KEK")},
+            "dbDefault": {"name": "dbDefault", "data": database(b"Microsoft Corporation UEFI CA")},
+            "dbxDefault": {"name": "dbxDefault", "data": database(b"factory-revocation")},
+        }
+        variables = vm._host_secure_boot_policy(template, host)
+        values = {item["name"]: item for item in variables}
+        for name in vm.SECURE_BOOT_ACTIVE_NAMES:
+            self.assertEqual(values[name]["data"], host[name]["data"])
+            self.assertEqual(values[name]["attr"], 39)
+        for name in vm.SECURE_BOOT_FACTORY_NAMES:
+            self.assertEqual(values[name]["data"], host[name]["data"])
+        self.assertEqual(values["VendorKeysNv"]["data"], "01")
+        self.assertEqual(values["CustomMode"]["data"], "00")
+
+    def test_host_secure_boot_policy_rejects_missing_active_microsoft_keys(self):
+        signature_type = bytes.fromhex("a1" * 16)
+
+        def database(payload: bytes) -> str:
+            return (
+                signature_type
+                + struct.pack("<III", 28 + 16 + len(payload), 0, 16 + len(payload))
+                + bytes(16)
+                + payload
+            ).hex()
+
+        template = {
+            name: {"name": name, "guid": "template", "attr": 39, "data": "template"}
+            for name in (*vm.SECURE_BOOT_ACTIVE_NAMES, "VendorKeysNv", "CustomMode")
+        }
+        host = {
+            "PK": {"name": "PK", "data": "active-pk"},
+            "KEK": {"name": "KEK", "data": database(b"owner KEK")},
+            "db": {"name": "db", "data": database(b"Microsoft Corporation active UEFI CA")},
+            "dbx": {"name": "dbx", "data": "active-revocation"},
+            "PKDefault": {"name": "PKDefault", "data": "a1"},
+            "KEKDefault": {"name": "KEKDefault", "data": database(b"OEM KEK")},
+            "dbDefault": {"name": "dbDefault", "data": database(b"Microsoft Corporation UEFI CA")},
+            "dbxDefault": {"name": "dbxDefault", "data": database(b"factory-revocation")},
+        }
+        with self.assertRaisesRegex(AppError, "active KEK does not contain a Microsoft certificate"):
+            vm._host_secure_boot_policy(template, host)
+
+    def test_host_secure_boot_snapshot_reads_active_and_default_variables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "state" / "host-active-microsoft.json"
+            names = (*vm.SECURE_BOOT_ACTIVE_NAMES, *vm.SECURE_BOOT_FACTORY_NAMES)
+            for index, name in enumerate(names, 1):
+                guid = vm.EFI_VARIABLE_GUIDS[name]
+                (root / f"{name}-{guid}").write_bytes(
+                    (7).to_bytes(4, "little") + bytes([index]),
+                )
+            with patch.object(vm, "EFI_VARIABLES_DIR", root), \
+                    patch.object(vm, "HOST_SECURE_BOOT_SNAPSHOT", snapshot):
+                variables = vm._host_secure_boot_variables()
+            self.assertEqual(variables["PK"]["data"], "01")
+            self.assertEqual(variables["dbxDefault"]["data"], "08")
+            saved = json.loads(snapshot.read_text(encoding="utf-8"))
+            self.assertEqual(saved["format"], 2)
+            self.assertEqual(
+                [item["name"] for item in saved["variables"]],
+                list(names),
+            )
+
+    def test_export_host_secure_boot_writes_reusable_active_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "export" / "factory-keys.json"
+            snapshot = root / "state" / "host-active-microsoft.json"
+            names = (*vm.SECURE_BOOT_ACTIVE_NAMES, *vm.SECURE_BOOT_FACTORY_NAMES)
+            for index, name in enumerate(names, 1):
+                guid = vm.EFI_VARIABLE_GUIDS[name]
+                (root / f"{name}-{guid}").write_bytes(
+                    (7).to_bytes(4, "little") + bytes([index]),
+                )
+            with patch.object(vm, "EFI_VARIABLES_DIR", root), \
+                    patch.object(vm, "HOST_SECURE_BOOT_SNAPSHOT", snapshot), \
+                    patch.object(vm, "require_root"):
+                result = vm.export_host_secure_boot(output)
+            self.assertEqual(result, output.resolve())
+            self.assertEqual(result.stat().st_mode & 0o777, 0o600)
+            exported = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(exported["policy"], "host-active-with-factory-defaults")
+            self.assertEqual(
+                [item["name"] for item in exported["variables"]],
+                list(names),
+            )
+            self.assertIn("PK", {item["name"] for item in exported["variables"]})
 
     def test_system_ovmf_pair_is_converted_to_persistent_per_vm_qcow2(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1019,6 +2106,44 @@ class VmTests(unittest.TestCase):
             rebuilt_profile["passthrough"]["pci"],
             ["01:00.0", "01:00.1", "09:00.0"],
         )
+
+    def test_disable_passthrough_restores_devirtualized_console_and_keeps_guest_vtd(self):
+        runner = Mock()
+        value = profile()
+        value["stage"] = "final"
+        value["guest_vtd"] = True
+        value["guest_dma_protection"] = True
+        value["minimal_devices"] = True
+        value["passthrough"] = {
+            "mode": "single-gpu", "pci": ["01:00.0", "01:00.1"],
+            "gpu_pci": ["01:00.0", "01:00.1"], "gpu_guest_pci": ["01:00.0"],
+            "extra_pci": [], "usb": [{"vendor_id": "1234", "product_id": "5678"}],
+            "network_pci": "09:00.0", "disable_virtual_network": True,
+            "rom_file": "/old/gpu.rom",
+        }
+        old_xml = build_domain_xml(value, stage="final")
+        rebuilt_xml = "<domain />"
+        with patch.object(vm, "require_root"), \
+                patch.object(vm, "vm_lock", return_value=nullcontext()), \
+                patch.object(vm, "load_profile", return_value=value), \
+                patch.object(vm, "_ensure_inactive"), \
+                patch.object(vm, "_dump_xml", return_value=old_xml), \
+                patch.object(vm, "_backup_xml"), \
+                patch.object(vm, "build_domain_xml", return_value=rebuilt_xml) as build, \
+                patch.object(vm, "_replace_definition"), \
+                patch.object(vm, "save_profile"), \
+                patch.object(vm, "atomic_write"), \
+                patch.object(hooks, "remove_single_gpu_hooks") as remove_hook:
+            vm.disable_passthrough("test-vm", runner)
+        self.assertEqual(build.call_args.kwargs["stage"], "devirtualized")
+        self.assertEqual(value["stage"], "devirtualized")
+        self.assertTrue(value["guest_vtd"])
+        self.assertTrue(value["guest_dma_protection"])
+        self.assertFalse(value["minimal_devices"])
+        self.assertEqual(value["passthrough"]["pci"], [])
+        self.assertEqual(value["passthrough"]["usb"], [])
+        self.assertIsNone(value["passthrough"]["rom_file"])
+        remove_hook.assert_called_once_with("test-vm")
 
     def test_existing_matching_qcow2_is_reused(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1113,6 +2238,452 @@ class KernelTests(unittest.TestCase):
         self.assertNotIn("1.3.6.1.4.1.2312.16.1.2", source)
         self.assertIn("rsa:3072", source)
 
+    def test_kernel_profiles_keep_stable_default_and_pin_72_test(self):
+        stable = kernel.kernel_profile()
+        experimental = kernel.kernel_profile("test-7.2")
+        self.assertEqual(stable.expected_version, (6, 19))
+        self.assertEqual(stable.tkg_version, "6.19-latest")
+        self.assertEqual(experimental.expected_version, (7, 2))
+        self.assertEqual(experimental.tkg_version, "v7.2.2")
+        self.assertTrue(experimental.test_release)
+
+    def test_kernel_patches_hide_native_hypercall_interception(self):
+        project = Path(__file__).parents[1]
+        for name in ("amd619.mypatch", "intel619.mypatch", "amd72-test.mypatch", "intel72-test.mypatch"):
+            patch = project / name
+            self.assertTrue(patch.is_file(), name)
+            kernel._validate_hypercall_patch(patch)
+
+    def test_kernel_deb_install_allows_replacing_held_packages(self):
+        source = inspect.getsource(kernel.build_kernel)
+        self.assertIn('"--reinstall"', source)
+        self.assertIn('"--allow-downgrades"', source)
+        self.assertIn('"--allow-change-held-packages"', source)
+        self.assertIn('"_processor_opt": "native"', source)
+        self.assertIn('"_timer_freq": "1000"', source)
+        self.assertIn('"_tickless": "2"', source)
+        self.assertIn('"_acs_override": "false"', source)
+        self.assertIn('if deb.name.startswith("linux-image-") and "-dbg_" not in deb.name', source)
+        self.assertNotIn('for image in sorted(BOOT_DIR.glob("vmlinuz-*-tkg-*")):\n        _validate_tkg_boot_config', source)
+
+    def test_amd72_kernel_patch_uses_svme_gated_vmcb01_cpuid_policy(self):
+        project = Path(__file__).parents[1]
+        patch_file = project / "amd72-test.mypatch"
+        text = patch_file.read_text(encoding="utf-8")
+        kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+        self.assertNotIn("kvm_hv_hypercall_enabled(vcpu)", text)
+        self.assertNotIn("nested.save.cpl == 3", text)
+        self.assertNotIn("vmcb_clr_intercept(&vmcb02->control, INTERCEPT_CPUID)", text)
+        self.assertNotIn("nested_vmcb02", text)
+        self.assertIn("if (svme)", text)
+        self.assertIn("if (is_guest_mode(vcpu))", text)
+        self.assertIn("svm->vmcb01.ptr->save.efer & EFER_SVME", text)
+        self.assertIn("if (vcpu->arch.efer & EFER_SVME)", text)
+        self.assertIn("case SVM_EXIT_CPUID:", text)
+        self.assertIn("if (kvm_rax_read(vcpu) == 0)", text)
+        self.assertIn("return NESTED_EXIT_HOST;", text)
+        self.assertIn("handle_fastpath_nested_cpuid0", text)
+        self.assertIn("kvm_find_cpuid_entry(vcpu, 0)", text)
+        self.assertIn("kvm_pmu_is_fastpath_emulation_allowed(vcpu)", text)
+        self.assertIn("kvm_is_cpuid_allowed(vcpu)", text)
+        self.assertIn("EXIT_FASTPATH_REENTER_GUEST", text)
+        self.assertIn("EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_cpuid);", text)
+        self.assertIn("svm_vcpu_exit_request", text)
+        self.assertIn("xfer_to_guest_mode_prepare();", text)
+        self.assertIn("aavm_nested_cpuid0_reenter:", text)
+        self.assertIn("goto aavm_nested_cpuid0_reenter;", text)
+        self.assertIn("svm->vmcb->save.rflags & X86_EFLAGS_TF", text)
+        self.assertIn("kvm_rip_write(vcpu, control->next_rip);", text)
+        self.assertIn("control->int_state &= ~SVM_INTERRUPT_SHADOW_MASK;", text)
+        self.assertIn("svm_can_defer_nested_cpuid0_exit_tail", text)
+        self.assertIn("control->exit_int_info & SVM_EXITINTINFO_VALID", text)
+        self.assertIn("control->event_inj & SVM_EVTINJ_VALID", text)
+        self.assertIn("nested_svm_virtualize_tpr(vcpu)", text)
+        self.assertIn("control->tlb_ctl == TLB_CONTROL_DO_NOTHING", text)
+        self.assertIn("kvm_clear_available_registers(vcpu, SVM_REGS_LAZY_LOAD_SET)", text)
+        self.assertIn("aavm_nested_cpuid0_finish_full_tail:", text)
+        self.assertIn("exit_code == SVM_EXIT_EXCP_BASE + DB_VECTOR", text)
+        self.assertIn("vmcb12_is_intercept(&svm->nested.ctl, exit_code)", text)
+        self.assertIn("kvm_deliver_exception_payload(vcpu, &db);", text)
+        self.assertNotIn("nested_svm_cache_nonpresent_npf", text)
+        self.assertNotIn("nested_svm_try_cached_npf_exit", text)
+        self.assertNotIn("npf_cache[4]", text)
+        self.assertIn("struct kvm_host_map vmcb12_map;", text)
+        self.assertIn("svm->nested.vmcb12_map_generation != generation", text)
+
+    def test_amd_cpuid_validation_rejects_missing_nested_db_direct_reflection(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text = text.replace(
+                "vmcb12_is_intercept(&svm->nested.ctl, exit_code)",
+                "removed_nested_db_owner_check",
+            )
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "nested #DB"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_validation_rejects_nested_npf_value_cache(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text += "\n+bool nested_svm_try_cached_npf_exit(struct vcpu_svm *svm);\n"
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "nested NPF value cache"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_validation_rejects_unchecked_vmcb12_map_reuse(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text = text.replace(
+                "svm->nested.vmcb12_map_generation != generation",
+                "removed_vmcb12_generation_guard",
+            )
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "VMCB12 map reuse"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_cpuid_validation_rejects_missing_leaf0_irqoff_fastpath(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text = text.replace("handle_fastpath_nested_cpuid0", "removed_nested_cpuid0")
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "IRQ-off fastpath"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_cpuid_validation_rejects_missing_deferred_tail_event_guard(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text = text.replace(
+                "control->exit_int_info & SVM_EXITINTINFO_VALID",
+                "removed_exit_int_info_guard",
+            )
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "deferred exit-tail"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_vmexit_profiler_correlates_nested_l0_cpuid_handler(self):
+        project = Path(__file__).parents[1]
+        analyzer = project / "verification" / "analyze_vmexit_profile.py"
+        verifier = project / "verification" / "verify_live_cpuid_policy.py"
+        profiler = (
+            project
+            / "verification"
+            / "nested-cpuid-static-fastpath-20260830"
+            / "VMEXIT_PROFILE.sh"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "profile.txt"
+            report.write_text(
+                "cpuid_path_correlation=enabled\n"
+                "@kvm_exit[114]: 32139\n"
+                "@kvm_nested_vmexit[114]: 32139\n"
+                "@kvm_cpuid[0, 0]: 15072\n"
+                "@nested_cpuid_l0_emulation[0, 0]: 15072\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["python3", str(analyzer), str(report)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        self.assertIn("cpuid_context=ALL_HARDWARE_EXITS_FROM_L2", result.stdout)
+        self.assertIn("cpuid_l2_l0_emulations=15072", result.stdout)
+        self.assertIn("cpuid_l2_forwarded_candidates=17067", result.stdout)
+        self.assertIn("cpuid_path_result=CORRELATED", result.stdout)
+        self.assertIn(
+            'svm.count("svm_clr_intercept(svm, INTERCEPT_CPUID);") == 2',
+            verifier.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "nested_cpuid_leaf0_short_reentry=",
+            verifier.read_text(encoding="utf-8"),
+        )
+        profiler_source = profiler.read_text(encoding="utf-8")
+        self.assertIn("/args.exit_reason == 114/", profiler_source)
+        self.assertIn("@pending_nested_cpuid[tid] = 1", profiler_source)
+        self.assertIn("@nested_cpuid_l0_emulation", profiler_source)
+        self.assertIn("resolve_vcpu_regs_offset", profiler_source)
+        self.assertIn("kprobe:nested_svm_exit_special", profiler_source)
+        self.assertIn("@nested_cpuid_observed", profiler_source)
+        self.assertIn("kvm_nested_vmexit_inject", profiler_source)
+        self.assertIn("@nested_exit_to_entry_ns", profiler_source)
+        self.assertIn("@nested_npf_exit_to_entry_ns", profiler_source)
+        self.assertIn("@nested_npf_injected_detail", profiler_source)
+        self.assertIn("@kvm_page_fault_gpa", profiler_source)
+        self.assertIn("@kvm_page_fault_detail", profiler_source)
+        self.assertIn("npf_stage_timing=enabled", profiler_source)
+        self.assertIn("kprobe:npf_interception", profiler_source)
+        self.assertIn("kretprobe:npf_interception", profiler_source)
+        self.assertIn("kprobe:nested_svm_inject_npf_exit", profiler_source)
+        self.assertIn("@npf_exit_to_l1_confirmed_ns", profiler_source)
+        self.assertIn("kprobe:nested_svm_vmexit", profiler_source)
+        self.assertIn("@nested_vmexit_ns", profiler_source)
+        self.assertIn("kprobe:__kvm_vcpu_map", profiler_source)
+        self.assertIn("@vmcb12_map_ns", profiler_source)
+        self.assertIn("@vmcb12_mapped_write_ns", profiler_source)
+        self.assertNotIn("kprobe:nested_svm_try_cached_npf_exit", profiler_source)
+        self.assertNotIn("@nested_npf_cache_hits", profiler_source)
+        self.assertNotIn("@nested_npf_cache_lookup_ns", profiler_source)
+        self.assertIn("@vmcb12_reused_write_ns", profiler_source)
+        self.assertIn("timing_values_valid=no", profiler_source)
+        self.assertIn('mode="${3:-cpuid}"', profiler_source)
+
+    def test_vmexit_analyzer_does_not_mislabel_legacy_nested_trace_as_forwarding(self):
+        project = Path(__file__).parents[1]
+        analyzer = project / "verification" / "analyze_vmexit_profile.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "legacy-profile.txt"
+            report.write_text(
+                "@kvm_exit[114]: 6938\n"
+                "@kvm_nested_vmexit[114]: 6938\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["python3", str(analyzer), str(report)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        self.assertIn("cpuid_path_result=UNRESOLVED_LEGACY_PROFILE", result.stdout)
+        self.assertIn("not whether L0 handled or forwarded", result.stdout)
+        self.assertNotIn("ALL_REFLECTED_TO_L1", result.stdout)
+
+    def test_vmexit_analyzer_reports_db_and_npf_reflections(self):
+        project = Path(__file__).parents[1]
+        analyzer = project / "verification" / "analyze_vmexit_profile.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "nested-profile.txt"
+            report.write_text(
+                "cpuid_path_correlation=enabled\n"
+                "@kvm_exit[65]: 700\n"
+                "@kvm_nested_vmexit[65]: 700\n"
+                "@kvm_nested_vmexit_inject[65]: 700\n"
+                "@kvm_exit[1024]: 500\n"
+                "@kvm_nested_vmexit[1024]: 500\n"
+                "@kvm_nested_vmexit_inject[1024]: 500\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["python3", str(analyzer), str(report)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        self.assertIn("db_reflections_to_l1=700", result.stdout)
+        self.assertIn("npf_reflections_to_l1=500", result.stdout)
+
+    def test_vmexit_analyzer_marks_low_noise_npf_mode_as_not_collected(self):
+        project = Path(__file__).parents[1]
+        analyzer = project / "verification" / "analyze_vmexit_profile.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "npf-profile.txt"
+            report.write_text(
+                "profile_mode=npf\n"
+                "cpuid_path_correlation=not-collected\n"
+                "@nested_npf_injected_gpa[12288]: 500\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["python3", str(analyzer), str(report)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        self.assertIn("cpuid_context=NOT_COLLECTED_NPF_MODE", result.stdout)
+        self.assertIn("cpuid_path_result=NOT_COLLECTED_NPF_MODE", result.stdout)
+        self.assertIn("npf_hardware_exits=not_collected", result.stdout)
+        self.assertIn("npf_reflections_to_l1=500", result.stdout)
+        self.assertIn("intentionally omitted", result.stdout)
+
+    def test_vmexit_analyzer_accepts_one_event_profile_boundary_delta(self):
+        project = Path(__file__).parents[1]
+        analyzer = project / "verification" / "analyze_vmexit_profile.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "boundary-profile.txt"
+            report.write_text(
+                "cpuid_path_correlation=enabled\n"
+                "@kvm_exit[114]: 4568\n"
+                "@kvm_nested_vmexit[114]: 4569\n"
+                "@nested_cpuid_observed[1, 0]: 913\n"
+                "@nested_npf_injected_gpa[12288]: 500\n"
+                "@nested_npf_injected_detail[12288, 4294967309]: 500\n"
+                "@kvm_page_fault_detail[12288, 4294967309]: 500\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["python3", str(analyzer), str(report)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+        self.assertIn(
+            "cpuid_context=ALL_HARDWARE_EXITS_FROM_L2_BOUNDARY_DELTA",
+            result.stdout,
+        )
+        self.assertIn(
+            "nested_observed_top=function=0x1,index=0x0,count=913",
+            result.stdout,
+        )
+        self.assertIn("nested_npf_top=gpa=0x3000,count=500", result.stdout)
+        self.assertIn(
+            "nested_npf_detail_top=gpa=0x3000,error=0x10000000d,count=500",
+            result.stdout,
+        )
+        self.assertIn(
+            "page_fault_detail_top=gpa=0x3000,error=0x10000000d,count=500",
+            result.stdout,
+        )
+
+    def test_ovmf_build_has_no_dynamic_native_cpuid_handoff(self):
+        project = Path(__file__).parents[1]
+        self.assertNotIn("ovmf-native-cpuid-exitbs.patch", build.LEGACY_FILES)
+        self.assertNotIn(
+            "ovmf-native-cpuid-exitbs.patch",
+            (project / "ovmfpatch.sh").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn("_validate_ovmf_native_cpuid_gate", inspect.getsource(build))
+
+    def test_amd_cpuid_validation_rejects_dynamic_switch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            patch_file.write_text(
+                "-\tsvm_set_intercept(svm, INTERCEPT_CPUID);\n"
+                "+\tsvm_clr_intercept(svm, INTERCEPT_CPUID);\n"
+                "+\tvmcb_clr_intercept(c, INTERCEPT_CPUID);\n"
+                "+\tif (svm_is_intercept(svm, INTERCEPT_CPUID))\n"
+                "+\t\tsvm_clr_intercept(svm, INTERCEPT_CPUID);\n"
+                "+#define KVM_AAVM_NATIVE_CPUID_PORT 0x4b41\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AppError, "CPUID intercept"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_cpuid_validation_rejects_direct_native_cpuid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            patch_file.write_text(
+                "-\tsvm_set_intercept(svm, INTERCEPT_CPUID);\n"
+                "+\tsvm_clr_intercept(svm, INTERCEPT_CPUID);\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AppError, "CPUID intercept"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_cpuid_validation_rejects_nested_cpuid_clear(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            patch_file.write_text(
+                "+\tif (vcpu->arch.efer & EFER_SVME)\n"
+                "+\t\tsvm_clr_intercept(svm, INTERCEPT_CPUID);\n"
+                "+\telse\n"
+                "+\t\tsvm_set_intercept(svm, INTERCEPT_CPUID);\n"
+                "+\tvmcb_clr_intercept(&vmcb02->control, INTERCEPT_CPUID);\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AppError, "VMCB02"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_cpuid_validation_rejects_l2_efer_policy(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text = text.replace(
+                "+\n"
+                "+\tif (is_guest_mode(vcpu))\n"
+                "+\t\tsvme = svm->vmcb01.ptr->save.efer & EFER_SVME;\n",
+                "",
+            )
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "VMCB01 保存的 L1 EFER"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_cpuid_validation_rejects_cpl3_vmcb02_branch(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text += (
+                "\n+\tif (vmcb02->save.cpl == 3)\n"
+                "+\t\tvmcb_clr_intercept(&vmcb02->control, INTERCEPT_CPUID);\n"
+            )
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "VMCB02"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_cpuid_validation_rejects_cpl3_hypercall_gate(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text = text.replace(
+                "+\tif (svme)\n",
+                "+\tif (kvm_hv_hypercall_enabled(vcpu) &&\n"
+                "+\t    svme)\n",
+            )
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "hypercall state"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_amd_cpuid_validation_rejects_early_leaf0_direct_path(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text += (
+                "\n+\t\tif (svm->vmcb->control.exit_code == SVM_EXIT_CPUID &&\n"
+                "+\t\t    kvm_rax_read(vcpu) == 0)\n"
+                "+\t\t\treturn kvm_emulate_cpuid(vcpu);\n"
+            )
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "nested CPUID exit"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
+    def test_kernel_patch_validation_rejects_hypercall_handler(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patch = Path(temporary) / "broken.mypatch"
+            patch.write_text("SVM_EXIT_VMMCALL = vmmcall_interception\n", encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "kvm_handle_invalid_op"):
+                kernel._validate_hypercall_patch(patch)
+
+    def test_kernel_source_metadata_reads_stable_point_release_from_tarball_makefile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "Makefile").write_text(
+                "VERSION = 7\nPATCHLEVEL = 2\nSUBLEVEL = 2\nEXTRAVERSION =\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(kernel._kernel_source_metadata(source), ((7, 2), "v7.2.2"))
+
+    def test_kernel_source_metadata_rejects_wrong_rc_for_test_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "Makefile").write_text(
+                "VERSION = 7\nPATCHLEVEL = 2\nSUBLEVEL = 0\nEXTRAVERSION = -rc1\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AppError, "固定使用 v7.2.2"):
+                kernel._validate_kernel_source(kernel.kernel_profile("test-7.2"), source)
+
+    def test_kernel_source_version_rejects_wrong_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "Makefile").write_text(
+                "VERSION = 6\nPATCHLEVEL = 19\n", encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AppError, "需要 Linux 7.2"):
+                kernel._validate_kernel_source(kernel.kernel_profile("test-7.2"), source)
+
     def test_ubuntu_kernel_fragment_enables_apparmor_lsm(self):
         fragment = kernel._ubuntu_kernel_fragment()
         self.assertIn("CONFIG_DEFAULT_SECURITY_APPARMOR=y", fragment)
@@ -1144,6 +2715,40 @@ class KernelTests(unittest.TestCase):
             with self.assertRaisesRegex(AppError, "nvidia-dkms-595-open"):
                 kernel._ensure_nvidia_dkms_support(runner)
 
+    def test_linux72_nvidia_compat_patch_replaces_removed_strncpy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "nvidia-595.84" / "nvidia"
+            source.mkdir(parents=True)
+            target = source / "os-interface.c"
+            target.write_text(
+                '#include "os-interface.h"\n'
+                '    strncpy(buf, current->comm, len - 1);\n',
+                encoding="utf-8",
+            )
+            with patch.object(kernel, "NVIDIA_DKMS_SOURCE_ROOT", Path(temporary)):
+                patched = kernel._patch_nvidia_dkms_for_linux_72()
+                self.assertEqual(patched, [target])
+                self.assertIn("strscpy(buf, current->comm, len);", target.read_text(encoding="utf-8"))
+                self.assertTrue(target.with_name("os-interface.c.kvm-aavm.orig").is_file())
+                self.assertEqual(kernel._patch_nvidia_dkms_for_linux_72(), [])
+
+    def test_cleanup_kernel_build_keeps_debs_and_removes_source_worktrees(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            work = state / "kernel-build" / "test-7.2"
+            (work / "linux-src-git").mkdir(parents=True)
+            (work / "linux-kernel.git").mkdir()
+            (work / "DEBS").mkdir()
+            runner = Mock()
+            with patch.object(kernel, "STATE_DIR", state), \
+                    patch.object(kernel, "prompt_yes_no", return_value=True), \
+                    patch.object(kernel, "require_root"):
+                kernel.cleanup_kernel_build(runner)
+            self.assertFalse((work / "linux-src-git").exists())
+            self.assertFalse((work / "linux-kernel.git").exists())
+            self.assertTrue((work / "DEBS").is_dir())
+            runner.run.assert_called_once_with(["apt-get", "clean"])
+
     def test_prepare_external_modules_runs_dkms_for_each_tkg_kernel(self):
         with tempfile.TemporaryDirectory() as temporary:
             boot = Path(temporary)
@@ -1173,6 +2778,56 @@ class KernelTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_gpu_iommu_preflight_rejects_missing_group_before_handoff(self):
+        display = PciDevice(
+            "01:00.0", "0300", "10de", "2c02", "RTX", iommu_group=None,
+            driver="nvidia",
+        )
+        with self.assertRaisesRegex(AppError, "no IOMMU group"):
+            cli._validate_gpu_iommu_isolation([display], [display])
+
+    def test_gpu_iommu_preflight_rejects_unselected_group_companion(self):
+        display = PciDevice(
+            "01:00.0", "0300", "10de", "2c02", "RTX", iommu_group=7,
+            driver="nvidia",
+        )
+        companion = PciDevice(
+            "00:01.1", "0604", "1022", "14db", "PCIe bridge", iommu_group=7,
+            driver="pcieport",
+        )
+        with self.assertRaisesRegex(AppError, "00:01.1 PCIe bridge"):
+            cli._validate_gpu_iommu_isolation(
+                [display], [display, companion],
+            )
+
+    def test_gpu_iommu_preflight_accepts_complete_isolated_group(self):
+        display = PciDevice(
+            "01:00.0", "0300", "10de", "2c02", "RTX", iommu_group=7,
+            driver="nvidia",
+        )
+        audio = PciDevice(
+            "01:00.1", "0403", "10de", "22e9", "GPU Audio", iommu_group=7,
+            driver="snd_hda_intel",
+        )
+        cli._validate_gpu_iommu_isolation(
+            [display, audio], [display, audio],
+        )
+
+    def test_additional_pci_preflight_checks_iommu_group_before_display_handoff(self):
+        candidate = PciDevice(
+            "08:00.0", "0200", "10ec", "8168", "Ethernet", iommu_group=4,
+            driver="r8169",
+        )
+        companion = PciDevice(
+            "08:00.1", "0200", "10ec", "8169", "Ethernet function", iommu_group=4,
+            driver="r8169",
+        )
+        with patch.object(cli, "pci_devices", side_effect=[[candidate], [candidate, companion]]), \
+                patch.object(cli, "prompt_yes_no", return_value=True), \
+                patch.object(cli, "prompt", return_value="1"):
+            with self.assertRaisesRegex(AppError, "08:00.1 Ethernet function"):
+                cli._select_additional_pci(set(), current=set(), ask=False)
+
     def test_recommended_resources_use_smt_and_reserve_host_cores(self):
         eight_core = {
             "memory_gib": 32,
@@ -1342,6 +2997,17 @@ class CliTests(unittest.TestCase):
             cli.menu(runner)
         minimal.assert_called_once_with(runner)
 
+    def test_recreate_tpm_is_available_from_cli_and_maintenance_menu(self):
+        args = cli.build_parser().parse_args(
+            ["recreate-tpm", "--vm", "win11", "--confirm"],
+        )
+        self.assertEqual(args.command, "recreate-tpm")
+        self.assertEqual(args.vm, "win11")
+        self.assertTrue(args.confirm)
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        self.assertIn('("vTPM 管理", lambda: _tpm_wizard(runner))', source)
+        self.assertIn("[4] 重製目前 TPM 身分", source)
+
     def test_one_shot_gpu_mode_is_removed(self):
         help_text = cli.build_parser().format_help()
         self.assertNotIn("enter-vm-once", help_text)
@@ -1350,7 +3016,7 @@ class CliTests(unittest.TestCase):
 
     def test_xml_validation_is_reachable_from_maintenance_menu(self):
         runner = Mock()
-        with patch.object(cli, "validate_vm_xml") as validate,                 patch.object(cli, "prompt", return_value="test-vm"),                 patch.object(cli, "prompt_int", side_effect=[9, 8, 0, 0]):
+        with patch.object(cli, "validate_vm_xml") as validate,                 patch.object(cli, "prompt", return_value="test-vm"),                 patch.object(cli, "prompt_int", side_effect=[9, 9, 0, 0]):
             cli.menu(runner)
         validate.assert_called_once_with("test-vm", runner)
 
@@ -1419,6 +3085,7 @@ class CliTests(unittest.TestCase):
             guest_secure_boot=False,
             guest_dma_protection=False,
             guest_core_isolation=False,
+            guest_hyperv_enlightenments=False,
         )
 
     def test_finalize_creation_installs_gpu_hook_after_xml(self):
@@ -1434,8 +3101,41 @@ class CliTests(unittest.TestCase):
             cli.finalize_creation("test-vm", runner)
         self.assertEqual(events, ["xml", "hook"])
 
+    def test_tpm_wizard_detects_manual_vtpm_without_saving_profile(self):
+        runner = Mock()
+        runner.run.return_value = Mock(
+            returncode=0,
+            stdout=(
+                "<domain><devices><tpm model='tpm-crb'><backend "
+                "type='emulator' version='2.0' persistent_state='yes'/>"
+                "</tpm></devices></domain>"
+            ),
+        )
+        defaults = []
+
+        def choose(_text, default, _minimum, _maximum):
+            defaults.append(default)
+            return 2
+
+        with patch.object(cli, "require_root"), \
+                patch.object(cli, "prompt", return_value="test-vm"), \
+                patch.object(cli, "load_profile", return_value=profile()), \
+                patch.object(cli, "prompt_int", side_effect=choose), \
+                patch.object(cli, "configure_tpm") as configure, \
+                patch.object(cli, "save_profile") as save:
+            cli._tpm_wizard(runner)
+        self.assertEqual(defaults, [2])
+        configure.assert_called_once_with("test-vm", "emulator", runner)
+        save.assert_not_called()
+
 
 class HostTests(unittest.TestCase):
+    def test_amd_host_config_explicitly_enables_avic(self):
+        self.assertEqual(
+            _managed_kvm_module_config("amd"),
+            "options kvm_amd nested=1 avic=1\noptions kvm ignore_msrs=0\n",
+        )
+
     def test_nested_module_option_is_enabled_idempotently(self):
         original = "options kvm_amd avic=1 nested=0\noptions kvm ignore_msrs=0\n"
         changed = _set_nested_module_option(original, "kvm_amd", True)
@@ -1466,6 +3166,7 @@ class HostTests(unittest.TestCase):
                 "linux-generic\tii \n"
                 "qemu-system-x86\thi \n"
                 "virt-manager\tii \n"
+                "libtpms0\tii \n"
                 "nvidia-driver-595-open\tii \n"
                 "bash\tii \n"
             )),
@@ -1477,14 +3178,14 @@ class HostTests(unittest.TestCase):
             host.configure_update_protection(runner, True)
 
         runner.run.assert_any_call([
-            "apt-mark", "hold", "linux-generic",
+            "apt-mark", "hold", "libtpms0", "linux-generic",
             "nvidia-driver-595-open", "virt-manager",
         ])
         values = update.call_args.kwargs
         self.assertTrue(values["update_protection_enabled"])
         self.assertEqual(
             values["update_protection_packages"],
-            ["linux-generic", "nvidia-driver-595-open", "qemu-system-x86", "virt-manager"],
+            ["libtpms0", "linux-generic", "nvidia-driver-595-open", "qemu-system-x86", "virt-manager"],
         )
         self.assertNotIn(
             "qemu-system-x86", values["update_protection_managed_holds"],

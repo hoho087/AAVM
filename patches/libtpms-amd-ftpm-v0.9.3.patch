@@ -1,0 +1,78 @@
+diff --git a/src/tpm2/PropertyCap.c b/src/tpm2/PropertyCap.c
+index db7d679..cacfe27 100644
+--- a/src/tpm2/PropertyCap.c
++++ b/src/tpm2/PropertyCap.c
+@@ -139,15 +139,15 @@ TPMPropertyIsDefined(
+ 	    break;
+ 	  case TPM_PT_VENDOR_TPM_TYPE:
+ 	    // vendor-defined value indicating the TPM model
+-	    *value = 1;
++	    *value = 2;
+ 	    break;
+ 	  case TPM_PT_FIRMWARE_VERSION_1:
+ 	    // more significant 32-bits of a vendor-specific value
+-	    *value = gp.firmwareV1;
++	    *value = FIRMWARE_V1;
+ 	    break;
+ 	  case TPM_PT_FIRMWARE_VERSION_2:
+ 	    // less significant 32-bits of a vendor-specific value
+-	    *value = gp.firmwareV2;
++	    *value = FIRMWARE_V2;
+ 	    break;
+ 	  case TPM_PT_INPUT_BUFFER:
+ 	    // maximum size of TPM2B_MAX_BUFFER
+diff --git a/src/tpm2/VendorString.h b/src/tpm2/VendorString.h
+index e33800d..698d5bf 100644
+--- a/src/tpm2/VendorString.h
++++ b/src/tpm2/VendorString.h
+@@ -65,7 +65,7 @@
+ /* Define up to 4-byte values for MANUFACTURER.  This value defines the response for
+    TPM_PT_MANUFACTURER in TPM2_GetCapability(). The following line should be un-commented and a
+    vendor specific string should be provided here. */
+-#define    MANUFACTURER    "IBM"
++#define    MANUFACTURER    "AMD"
+ 
+ /*     The following #if macro may be deleted after a proper MANUFACTURER is provided. */
+ #ifndef MANUFACTURER
+@@ -79,9 +79,9 @@
+        TPM_PT_VENDOR_STRING_(1-4) in TPM2_GetCapability(). The following line should be un-commented
+        and a vendor specific string.  The vendor strings 2-4 may also be defined as appropriate. */
+ 
+-#define       VENDOR_STRING_1       "SW  "
+-#define       VENDOR_STRING_2       " TPM"
+-//#define       VENDOR_STRING_3
++#define       VENDOR_STRING_1       "AMD"
++#define       VENDOR_STRING_2       "fTPM"
++#define       VENDOR_STRING_3       "2.0"
+ //#define       VENDOR_STRING_4
+ 
+ /*     The following #if macro may be deleted after a proper VENDOR_STRING_1 is provided. */
+@@ -93,10 +93,10 @@
+ /* the more significant 32-bits of a vendor-specific value indicating the version of the firmware
+    The following line should be un-commented and a vendor specific firmware V1 should be provided
+    here. The FIRMWARE_V2 may also be defined as appropriate. */
+-#define   FIRMWARE_V1         (0x20191023)
++#define   FIRMWARE_V1         (0x00050000)
+ 
+ // the less significant 32-bits of a vendor-specific value indicating the version of the firmware
+-#define   FIRMWARE_V2         (0x00163636)
++#define   FIRMWARE_V2         (0x00000000)
+ 
+ // The following #if macro may be deleted after a proper FIRMWARE_V1 is provided.
+ #ifndef FIRMWARE_V1
+diff --git a/src/tpm_tpm2_interface.c b/src/tpm_tpm2_interface.c
+index 8d8117e..53800a0 100644
+--- a/src/tpm_tpm2_interface.c
++++ b/src/tpm_tpm2_interface.c
+@@ -362,9 +362,9 @@ static char *TPM2_GetInfo(enum TPMLIB_InfoFlags flags)
+     "}";
+     const char *tpmattrs_temp =
+     "\"TPMAttributes\":{"
+-        "\"manufacturer\":\"id:00001014\","
++        "\"manufacturer\":\"id:414d4400\","
+         "\"version\":\"id:%08X\","
+-        "\"model\":\"swtpm\""
++        "\"model\":\"AMD fTPM 2.0\""
+     "}";
+     const char *tpmfeatures_temp =
+     "\"TPMFeatures\":{"

@@ -46,8 +46,10 @@ if [[ ! -f vars.sh ]]; then
   echo "xhci=\"$xhci\""                      >> vars.sh
   echo "cpu=\"$cpu\""                        >> vars.sh
   echo "virtio=\"$virtio\""                  >> vars.sh
-  echo "edk2bridge_1022=\"$pcibridge_1022\"" >> vars.sh
-  echo "edk2bridge_8086=\"$pcibridge_8086\"" >> vars.sh
+  # OVMF's Q35 MCH constant represents the host/DRAM bridge (class 0600),
+  # not a downstream PCIe bridge (class 0604).
+  echo "edk2bridge_1022=\"$hostbridge_1022\"" >> vars.sh
+  echo "edk2bridge_8086=\"$hostbridge_8086\"" >> vars.sh
 else
   echo -e "$(pwd)/\e[1mvars.sh\e[0m found."
   source vars.sh
@@ -56,8 +58,8 @@ else
   echo "xhci=\"$xhci\""                      >> vars.sh
   echo "cpu=\"$cpu\""                        >> vars.sh
   echo "virtio=\"$virtio\""                  >> vars.sh
-  echo "edk2bridge_1022=\"$pcibridge_1022\"" >> vars.sh
-  echo "edk2bridge_8086=\"$pcibridge_8086\"" >> vars.sh
+  echo "edk2bridge_1022=\"$hostbridge_1022\"" >> vars.sh
+  echo "edk2bridge_8086=\"$hostbridge_8086\"" >> vars.sh
 fi
 
 if (( cpu < 0 || cpu > 65520 || cpu % 4 != 0 )); then
@@ -805,6 +807,18 @@ echo "\"GSI                                              -> \"${gsi}"
 sed -i "$file_acpibuild" -Ee "s/\"GSI/\"${gsi}/g"
 echo "100000000                                         -> 41666666"
 sed -i "$file_acpibuild" -Ee "s/100000000/41666666/"
+echo "HPET period > limit                              -> limit < period"
+if ! grep -Fq 'aml_lgreater(period, aml_int(41666666))' "$file_acpibuild"; then
+  echo "Unsupported QEMU source: HPET period validation was not found" >&2
+  exit 1
+fi
+# Preserve the HPET _STA result while avoiding QEMU's fixed LEqual/LGreater
+# AML shape. The reverse comparison is logically identical.
+sed -i "$file_acpibuild" -Ee 's/aml_lgreater\(period, aml_int\(41666666\)\)/aml_lless(aml_int(41666666), period)/'
+if ! grep -Fq 'aml_lless(aml_int(41666666), period)' "$file_acpibuild"; then
+  echo "Failed to rewrite HPET period validation" >&2
+  exit 1
+fi
 
 echo "  $file_acpi_cpu"
 get_new_string $(shuf -i 5-7 -n 1) 3
@@ -828,46 +842,48 @@ echo ".S08.                                             -> .${path}08."
 sed -i "$file_piix" -Ee "s/.S08./.${path}08./"
 
 echo "  $file_lpcich9"
-IFS=':'
-cpu_vendor=( $(cat /proc/cpuinfo | grep 'vendor_id' | uniq) )
-cpu_vendor="${cpu_vendor[1]}"
-cpu_name=( $(cat /proc/cpuinfo | grep 'model name' | uniq) )
-cpu_name="${cpu_name[1]}"
+cpu_vendor="$(awk -F: '/^vendor_id[[:space:]]*:/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}' /proc/cpuinfo)"
+cpu_name="$(awk -F: '/^model name[[:space:]]*:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
+if [[ "$cpu_vendor" != "AuthenticAMD" && "$cpu_vendor" != "GenuineIntel" ]]; then
+  echo "Unsupported x86 CPU vendor: ${cpu_vendor:-unknown}" >&2
+  exit 1
+fi
+[[ -n "$cpu_name" ]] || cpu_name="$cpu_vendor Processor"
 #echo ".SF8.                                             -> .${path}F8."
 #sed -i "$file_lpcich9" -Ee "s/.SF8./.${path}F8./"
 echo ".SF8.                                             -> .LPCB."
 echo "ICH9 LPC bridge                                   -> LPC Bridge"
 sed -i "$file_lpcich9" -Ee "s/.SF8./.LPCB./"
 sed -i "$file_lpcich9" -Ee "s/ICH9 LPC bridge/LPC Bridge/"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x$vendor;"
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x1022;"
   echo "PCI_DEVICE_ID_INTEL_ICH9_8;                       -> 0x790E;  // FCH LPC Bridge"
-  sed -i "$file_lpcich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x$vendor;/"
+  sed -i "$file_lpcich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x1022;/"
   sed -i "$file_lpcich9" -Ee "s/PCI_DEVICE_ID_INTEL_ICH9_8;/0x$lpc_1022;/"
 else
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x$vendor;"
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;"
   echo "PCI_DEVICE_ID_INTEL_ICH9_8;                       -> 0x068D;  // Comet Lake LPC Controller"
-  sed -i "$file_lpcich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x$vendor;/"
+  sed -i "$file_lpcich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x8086;/"
   sed -i "$file_lpcich9" -Ee "s/PCI_DEVICE_ID_INTEL_ICH9_8;/0x$lpc_8086;/"
 fi
 
 echo "  $file_smbusich9"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x$vendor;"
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x1022;"
   echo "PCI_DEVICE_ID_INTEL_ICH9_6;                       -> 0x790B;  // FCH SMBus Controller"
-  sed -i "$file_smbusich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x$vendor;/"
+  sed -i "$file_smbusich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x1022;/"
   sed -i "$file_smbusich9" -Ee "s/PCI_DEVICE_ID_INTEL_ICH9_6;/0x$smbus_1022;/"
 else
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x$vendor;"
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;"
   echo "PCI_DEVICE_ID_INTEL_ICH9_6;                       -> 0xA3A3;  // Comet Lake PCH-V SMBus Host Controller"
-  sed -i "$file_smbusich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x$vendor;/"
+  sed -i "$file_smbusich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x8086;/"
   sed -i "$file_smbusich9" -Ee "s/PCI_DEVICE_ID_INTEL_ICH9_6;/0x$smbus_8086;/"
 fi
 echo "ICH9 SMBUS Bridge                                 -> SMBus Bridge"
 sed -i "$file_smbusich9" -Ee "s/ICH9 SMBUS Bridge/SMBus Bridge/"
 
 echo "  $file_intelhda"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
   hdaname_sed=$(escape_sed_replacement "$hdaname_1022")
   echo "PCI_VENDOR_ID_INTEL;                              -> 0x1022;"
   echo "0x293e;                                           -> 0x$hdaudio_1022;  // $hdaname_1022"
@@ -903,8 +919,9 @@ sed -i "$file_multiboot" -Ee "s/\"qemu\"/\"Windows Boot Manager\"/"
 #echo "  $file_pcpiix"
 
 echo "  $file_pcq35"
-echo "Standard PC (Q35 + ICH9, 2009)                    -> ${cpu_name:1}"
-sed -i "$file_pcq35" -Ee "s/Standard PC \(Q35 \+ ICH9, 2009\)/${cpu_name:1}/"
+cpu_name_sed=$(escape_sed_replacement "$cpu_name")
+echo "Standard PC (Q35 + ICH9, 2009)                    -> $cpu_name"
+sed -i "$file_pcq35" -Ee "s|Standard PC \(Q35 \+ ICH9, 2009\)|$cpu_name_sed|"
 echo "    pc_q35_machine_options(m);"
 echo "    v v v v v v v v v v v v v v v v v v v v"
 echo "    m->smbios_memory_device_size = 8 * GiB;"
@@ -932,15 +949,15 @@ sed -i "$file_core" -Ee "s/QEMU MICRODRIVE/$new_ide_cfata_model/"
 sed -i "$file_core" -Ee "s/QEMU HARDDISK/$new_default_model/"
 
 echo "  $file_ich"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x$vendor;"
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x1022;"
   echo "PCI_DEVICE_ID_INTEL_82801IR;                      -> 0x7901;  // FCH SATA Controller [AHCI mode]"
-  sed -i "$file_ich" -Ee "s/PCI_VENDOR_ID_INTEL;/0x$vendor;/"
+  sed -i "$file_ich" -Ee "s/PCI_VENDOR_ID_INTEL;/0x1022;/"
   sed -i "$file_ich" -Ee "s/PCI_DEVICE_ID_INTEL_82801IR;/0x$sata_1022;/"
 else
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x$vendor;"
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;"
   echo "PCI_DEVICE_ID_INTEL_82801IR;                      -> 0x06D2;  // Comet Lake SATA AHCI Controller"
-  sed -i "$file_ich" -Ee "s/PCI_VENDOR_ID_INTEL;/0x$vendor;/"
+  sed -i "$file_ich" -Ee "s/PCI_VENDOR_ID_INTEL;/0x8086;/"
   sed -i "$file_ich" -Ee "s/PCI_DEVICE_ID_INTEL_82801IR;/0x$sata_8086;/"
 fi
 
@@ -1767,40 +1784,40 @@ struct smbios_type_28 {\n\
 } QEMU_PACKED;\n"
 
 echo "  $header_pci"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
   echo "QEMU               0x1234                         -> QEMU               0x1022"
   echo "VMWARE             0x15ad                         -> VMWARE             0x1022"
 #  echo "QUMRANET    0x1af4                                -> QUMRANET    0x1022"
   echo "QUMRANET 0x1af4                                   -> QUMRANET 0x1022"
   echo "REDHAT             0x1b36                         -> REDHAT             0x1022"
-  echo "PCIE_RP     0x000c                                -> PCIE_RP     0x1448  // Renoir Device 24: Function 0"
-  echo "XHCI        0x000d                                -> XHCI        0x7914  // FCH USB XHCI Controller"
-  echo "PCIE_BRIDGE 0x000e                                -> PCIE_BRIDGE 0x1633  // Renoir PCIe GPP Bridge"
+  echo "PCIE_RP     0x000c                                -> PCIE_RP     0x$rootport_1022  // PCIe Root Port"
+  echo "XHCI        0x000d                                -> XHCI        0x$xhci_1022  // USB XHCI Controller"
+  echo "PCIE_BRIDGE 0x000e                                -> PCIE_BRIDGE 0x$pcibridge_1022  // PCIe Bridge"
   sed -i "$header_pci" -Ee "s/QEMU               0x1234/QEMU               0x1022/"
   sed -i "$header_pci" -Ee "s/VMWARE             0x15ad/VMWARE             0x1022/"
 #  sed -i "$header_pci" -Ee "s/QUMRANET    0x1af4/QUMRANET    0x1022/"
   sed -i "$header_pci" -Ee "s/QUMRANET 0x1af4/QUMRANET 0x1022/"
   sed -i "$header_pci" -Ee "s/REDHAT             0x1b36/REDHAT             0x1022/"
   sed -i "$header_pci" -Ee "s/PCIE_RP     0x000c/PCIE_RP     0x$rootport_1022/"
-  sed -i "$header_pci" -Ee "s/XHCI        0x000d/XHCI        0x$( printf '%X' $((xhci)) )/"
-  sed -i "$header_pci" -Ee "s/PCIE_BRIDGE 0x000e/PCIE_BRIDGE 0x$hostbridge_1022/"
+  sed -i "$header_pci" -Ee "s/XHCI        0x000d/XHCI        0x$xhci_1022/"
+  sed -i "$header_pci" -Ee "s/PCIE_BRIDGE 0x000e/PCIE_BRIDGE 0x$pcibridge_1022/"
 else
   echo "QEMU               0x1234                         -> QEMU               0x8086"
   echo "VMWARE             0x15ad                         -> VMWARE             0x8086"
 #  echo "QUMRANET    0x1af4                                -> QUMRANET    0x8086"
   echo "QUMRANET 0x1af4                                   -> QUMRANET 0x8086"
   echo "REDHAT             0x1b36                         -> REDHAT             0x8086"
-  echo "PCIE_RP     0x000c                                -> PCIE_RP     0x06BA  // Comet Lake PCI Express Root Port #1"
-  echo "XHCI        0x000d                                -> XHCI        0x06ED  // Comet Lake USB 3.1 xHCI Host Controller"
-  echo "PCIE_BRIDGE 0x000e                                -> PCIE_BRIDGE 0x9B54  // 10th Gen Core Processor Host Bridge/DRAM Registers"
+  echo "PCIE_RP     0x000c                                -> PCIE_RP     0x$rootport_8086  // PCIe Root Port"
+  echo "XHCI        0x000d                                -> XHCI        0x$xhci_8086  // USB XHCI Controller"
+  echo "PCIE_BRIDGE 0x000e                                -> PCIE_BRIDGE 0x$pcibridge_8086  // PCIe Controller"
   sed -i "$header_pci" -Ee "s/QEMU               0x1234/QEMU               0x8086/"
   sed -i "$header_pci" -Ee "s/VMWARE             0x15ad/VMWARE             0x8086/"
 #  sed -i "$header_pci" -Ee "s/QUMRANET    0x1af4/QUMRANET    0x8086/"
   sed -i "$header_pci" -Ee "s/QUMRANET 0x1af4/QUMRANET 0x8086/"
   sed -i "$header_pci" -Ee "s/REDHAT             0x1b36/REDHAT             0x8086/"
   sed -i "$header_pci" -Ee "s/PCIE_RP     0x000c/PCIE_RP     0x$rootport_8086/"
-  sed -i "$header_pci" -Ee "s/XHCI        0x000d/XHCI        0x$( printf '%X' $((xhci)) )/"
-  sed -i "$header_pci" -Ee "s/PCIE_BRIDGE 0x000e/PCIE_BRIDGE 0x$hostbridge_8086/"
+  sed -i "$header_pci" -Ee "s/XHCI        0x000d/XHCI        0x$xhci_8086/"
+  sed -i "$header_pci" -Ee "s/PCIE_BRIDGE 0x000e/PCIE_BRIDGE 0x$pcibridge_8086/"
 fi
 echo "0x1111                                            -> 0x$device"
 sed -i "$header_pci" -Ee "s/0x1111/0x$device/"
@@ -1820,14 +1837,14 @@ sed -i "$file_makefile" -Ee "s/808610d3/808610F6/"
 sed -i "$file_makefile" -Ee "s/DID := 10d3/DID := 10F6/"
 
 echo "  $header_pciids"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
-  echo "PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0           -> PCI_DEVICE_ID_INTEL_P35_MCH      0x$pcibridge_1022"
-  sed -i "$header_pciids" -Ee "s/PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0/PCI_DEVICE_ID_INTEL_P35_MCH      0x$pcibridge_1022/"
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
+  echo "PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0           -> PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_1022"
+  sed -i "$header_pciids" -Ee "s/PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0/PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_1022/"
   echo "VMWARE             0x15ad                         -> VMWARE             0x1022"
   sed -i "$header_pciids" -Ee "s/VMWARE             0x15ad/VMWARE             0x1022/"
 else
-  echo "PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0           -> PCI_DEVICE_ID_INTEL_P35_MCH      0x$pcibridge_8086"
-  sed -i "$header_pciids" -Ee "s/PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0/PCI_DEVICE_ID_INTEL_P35_MCH      0x$pcibridge_8086/"
+  echo "PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0           -> PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_8086"
+  sed -i "$header_pciids" -Ee "s/PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0/PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_8086/"
   echo "VMWARE             0x15ad                         -> VMWARE             0x8086"
   sed -i "$header_pciids" -Ee "s/VMWARE             0x15ad/VMWARE             0x8086/"
 fi
@@ -1867,7 +1884,7 @@ sed -i "$file_cpu" -Ee "/    object_property_set_str\(OBJECT\(cpu\), \"model-id\
     g_type4_upgrade = def->t4_upgrade;\n\
     g_type4_version = malloc(strlen(def->model_id) + 1);\n\
     strcpy(g_type4_version, def->model_id);"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
   echo "\"QEMU Virtual CPU version \"                       -> \"AMD CPU version \""
   echo "\"Common KVM processor\"                            -> \"Common AMD processor\""
   echo "\"Common 32-bit KVM processor\"                     -> \"Common 32-bit AMD processor\""
@@ -1946,7 +1963,7 @@ echo "\"VS#1\0\0\0\0\0\0\0\0\"                            -> 0"
 sed -i "$file_kvm" -Ee "s/\"VS#1\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\"/\"\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\"/"
 echo "\"XenVMMXenVMM\"                                    -> 0"
 sed -i "$file_kvm" -Ee "s/\"XenVMMXenVMM\"/\"\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\\\\0\"/"
-if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
+if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
   echo "KVMKVMKVM\0\0\0                                   -> AuthenticAMD"
   sed -i "$file_kvm" -Ee "s/KVMKVMKVM\\\\0\\\\0\\\\0/AuthenticAMD/"
 else
@@ -1968,8 +1985,41 @@ sed -i "$file_kvmcpu" -Ee "s/\"kvm-steal-time\", \"on\"/\"kvm-steal-time\", \"of
 sed -i "$file_kvmcpu" -Ee "s/\"kvm-pv-eoi\", \"on\"/\"kvm-pv-eoi\", \"off\"/"
 sed -i "$file_kvmcpu" -Ee "s/\"kvmclock-stable-bit\", \"on\"/\"kvmclock-stable-bit\", \"off\"/"
 
+echo "Disable KVM hypercall instruction rewrite quirk"
+if ! grep -Fq 'KVM_X86_QUIRK_FIX_HYPERCALL_INSN' "$(pwd)/qemu/linux-headers/asm-x86/kvm.h"; then
+  echo "Unsupported QEMU source: KVM hypercall quirk ABI is missing" >&2
+  exit 1
+fi
+kvm_arch_init_first_count="$(
+  sed -n '/^int kvm_arch_init(/,/^}$/p' "$file_kvm" |
+    grep -Fc '    first = false;' || true
+)"
+if [[ "$kvm_arch_init_first_count" -ne 1 ]]; then
+  echo "Unsupported QEMU source: kvm_arch_init insertion point is ambiguous" >&2
+  exit 1
+fi
+# KVM rewrites a guest VMCALL/VMMCALL when it does not match the host vendor.
+# Disable that compatibility quirk per VM so an invalid instruction remains
+# #UD, matching bare-metal behavior and preserving guest hypervisor semantics.
+sed -i '/^int kvm_arch_init(/,/^}$/ {
+  /    first = false;/i\
+    /* KVM-AAVM: disable KVM hypercall rewrite quirk. */\
+    if (kvm_check_extension(s, KVM_CAP_DISABLE_QUIRKS2) & KVM_X86_QUIRK_FIX_HYPERCALL_INSN) {\
+        ret = kvm_vm_enable_cap(s, KVM_CAP_DISABLE_QUIRKS2, 0,\
+                                KVM_X86_QUIRK_FIX_HYPERCALL_INSN);\
+        if (ret < 0) {\
+            error_report("failed to disable KVM hypercall instruction rewrite quirk");\
+            return ret;\
+        }\
+    }
+}' "$file_kvm"
+if ! grep -Fq 'KVM-AAVM: disable KVM hypercall rewrite quirk.' "$file_kvm"; then
+  echo "Failed to disable KVM hypercall rewrite quirk" >&2
+  exit 1
+fi
+
 #echo "  $file_configvgaqxl"
-#if [[ "${cpu_vendor:1}" == "AuthenticAMD" ]]; then
+#if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
 #  echo "CONFIG_VGA_VID=0x1b36                             -> CONFIG_VGA_VID=0x1022"
 #  sed -i "$file_configvgaqxl" -Ee "s/CONFIG_VGA_VID=0x1b36/CONFIG_VGA_VID=0x1022/"
 #else

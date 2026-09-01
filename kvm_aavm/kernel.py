@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from .hardware import cpu_info
 from .paths import OFFLINE_DIR, PROJECT_DIR, STATE_DIR
-from .util import AppError, Runner, atomic_write, require_root
+from .util import AppError, Runner, atomic_write, prompt_yes_no, require_root
 
 MOK_CERTIFICATE = Path("/var/lib/shim-signed/mok/MOK.der")
 MOK_PRIVATE_KEY = Path("/var/lib/shim-signed/mok/MOK.priv")
@@ -19,6 +21,325 @@ KERNEL_MOK_PRIVATE_KEY = KERNEL_MOK_DIRECTORY / "kernel-signing.key"
 KERNEL_MOK_COMMON_NAME = "KVM-AAVM Custom Kernel Signing"
 KERNEL_SIGNING_HOOK = Path("/etc/kernel/postinst.d/kvm-aavm-sign-custom-kernel")
 BOOT_DIR = Path("/boot")
+NVIDIA_DKMS_SOURCE_ROOT = Path("/usr/src")
+
+
+@dataclass(frozen=True)
+class KernelProfile:
+    """An offline, version-pinned linux-tkg build target."""
+
+    key: str
+    label: str
+    tkg_version: str
+    source_relpath: str
+    patch_dirname: str
+    patch_suffix: str
+    expected_version: tuple[int, int]
+    test_release: bool = False
+
+
+KERNEL_PROFILES = {
+    "stable": KernelProfile(
+        key="stable",
+        label="Linux 6.19 stable deployment kernel",
+        tkg_version="6.19-latest",
+        source_relpath="sources/linux",
+        patch_dirname="linux619-tkg-userpatches",
+        patch_suffix="619",
+        expected_version=(6, 19),
+    ),
+    "test-7.2": KernelProfile(
+        key="test-7.2",
+        label="Linux 7.2.2 experimental HVCI/VBS kernel",
+        tkg_version="v7.2.2",
+        source_relpath="sources/linux-7.2",
+        patch_dirname="linux72-tkg-userpatches",
+        patch_suffix="72-test",
+        expected_version=(7, 2),
+        test_release=True,
+    ),
+}
+
+
+def kernel_profile(key: str = "stable") -> KernelProfile:
+    try:
+        return KERNEL_PROFILES[key]
+    except KeyError as exc:
+        raise AppError(f"未知的核心 profile：{key}") from exc
+
+
+def _kernel_source_metadata(source: Path) -> tuple[tuple[int, int], str | None]:
+    makefile = source / "Makefile"
+    if not makefile.is_file():
+        raise AppError(f"Linux source is missing Makefile: {makefile}")
+    text = makefile.read_text(encoding="utf-8", errors="replace")
+    values: dict[str, str] = {}
+    for key in ("VERSION", "PATCHLEVEL", "SUBLEVEL", "EXTRAVERSION"):
+        match = re.search(rf"^{key}\s*=\s*(\d+)", text, re.MULTILINE)
+        if key in {"VERSION", "PATCHLEVEL"} and match is None:
+            raise AppError(f"Linux source Makefile is missing {key}: {makefile}")
+        if match is not None:
+            values[key] = match.group(1)
+        elif key == "EXTRAVERSION":
+            # Do not let ``\s*`` consume the newline after an empty
+            # EXTRAVERSION and accidentally capture the following Makefile
+            # assignment (stable point releases leave this field blank).
+            extra = re.search(r"^EXTRAVERSION[ \t]*=[ \t]*(.*)$", text, re.MULTILINE)
+            values[key] = extra.group(1).strip() if extra else ""
+        else:
+            values[key] = "0"
+    version = (int(values["VERSION"]), int(values["PATCHLEVEL"]))
+    release = f"{values['VERSION']}.{values['PATCHLEVEL']}.{values['SUBLEVEL']}{values['EXTRAVERSION']}"
+    tag = None
+    if values["EXTRAVERSION"].startswith("-rc"):
+        # Linux release candidates use the kernel.org short tag form, e.g.
+        # Makefile 7.2.0-rc7 -> git tag v7.2-rc7.
+        tag = f"v{values['VERSION']}.{values['PATCHLEVEL']}-{values['EXTRAVERSION'][1:]}"
+    elif not values["EXTRAVERSION"] and int(values["SUBLEVEL"]) > 0:
+        # Stable point releases use the full tag, e.g. 7.2.2 -> v7.2.2.
+        tag = f"v{release}"
+    return version, tag
+
+
+def _kernel_source_version(source: Path) -> tuple[int, int]:
+    return _kernel_source_metadata(source)[0]
+
+
+def _validate_kernel_source(profile: KernelProfile, source: Path) -> None:
+    actual = _kernel_source_version(source)
+    if actual != profile.expected_version:
+        expected = ".".join(str(part) for part in profile.expected_version)
+        got = ".".join(str(part) for part in actual)
+        raise AppError(f"{profile.label} 需要 Linux {expected} source，收到 Linux {got}：{source}")
+    if not profile.test_release:
+        return
+    _, source_tag = _kernel_source_metadata(source)
+    if source_tag is None:
+        raise AppError(
+            "7.2 實驗 profile 需要可辨識的固定 release tag source；"
+            f"實際版本無法辨識：{source}"
+        )
+    if source_tag != profile.tkg_version:
+        raise AppError(
+            f"7.2 實驗 profile 固定使用 {profile.tkg_version}，收到 {source_tag}：{source}"
+        )
+    tag = ""
+    # A tarball lives inside the deployer repository and must not accidentally
+    # inherit a tag from a parent .git directory.
+    if (source / ".git").exists():
+        describe = subprocess.run(
+            ["git", "-C", str(source), "describe", "--tags", "--exact-match"],
+            check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        tag = describe.stdout.strip()
+    if tag and tag != source_tag:
+        raise AppError(
+            f"7.2 source 的 git tag ({tag}) 與 Makefile 版本 ({source_tag}) 不一致：{source}"
+        )
+
+
+def _kernel_patch(profile: KernelProfile) -> Path:
+    vendor = "amd" if cpu_info()["vendor"] == "amd" else "intel"
+    patch = PROJECT_DIR / f"{vendor}{profile.patch_suffix}.mypatch"
+    if not patch.is_file():
+        if profile.test_release:
+            raise AppError(
+                f"{profile.label} 尚未提供 CPU 對應補丁：{patch.name}。"
+                "不能把 6.19 補丁直接套到 7.2；請先完成該版本的 port。"
+            )
+        raise AppError(f"找不到自訂核心補丁：{patch}")
+    return patch
+
+
+def _validate_hypercall_patch(patch: Path) -> None:
+    """Require native-invalid hypercalls so VMAware sees the bare-metal #UD."""
+    text = patch.read_text(encoding="utf-8", errors="replace")
+    if "SVM_EXIT_VMMCALL" in text:
+        marker = "SVM_EXIT_VMMCALL"
+    elif "EXIT_REASON_VMCALL" in text:
+        marker = "EXIT_REASON_VMCALL"
+    else:
+        raise AppError(
+            f"核心補丁缺少 VMCALL/VMMCALL exit handler：{patch.name}。"
+        )
+    handler = re.compile(
+        rf"\[\s*{re.escape(marker)}\s*\]\s*=\s*kvm_handle_invalid_op\b",
+        re.MULTILINE,
+    )
+    if handler.search(text) is None:
+        raise AppError(
+            f"核心補丁 {patch.name} 未將 {marker} 導向 kvm_handle_invalid_op；"
+            "拒絕建置會暴露 KVM hypercall interception 的核心。"
+        )
+
+
+def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
+    """Require the Linux 7.2 CPUID/#DB and nested-NPF guarded fastpaths.
+
+    Firmware and an ordinary Windows kernel retain KVM CPUID virtualization.
+    VMCB01 may pass CPUID through only after EFER.SVME is enabled.  Nested
+    VMCB02 keeps the architectural OR-merged L0/L1 intercepts, so this policy
+    must not rewrite the hardware intercept from a CPL snapshot.  L2 leaf 0 is
+    handled from a precomputed KVM CPUID cache in the IRQ-off VM-Exit fastpath;
+    all other leaves retain normal L1 ownership.  The nested special handler is
+    retained as the correctness fallback when fastpath emulation is disallowed.
+    """
+    if not patch.name.startswith("amd"):
+        return
+    text = patch.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    added_cpuid = [
+        line for line in lines
+        if line.startswith("+") and not line.startswith("+++")
+        and "INTERCEPT_CPUID" in line
+    ]
+    added_text = "\n".join(
+        line[1:] for line in lines
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    recalc_gated = re.findall(
+        r"if \(svme\)\s*\n"
+        r"\s*svm_clr_intercept\(svm, INTERCEPT_CPUID\);\s*\n"
+        r"\s*else\s*\n"
+        r"\s*svm_set_intercept\(svm, INTERCEPT_CPUID\);",
+        added_text,
+    )
+    init_gated = re.findall(
+        r"if \(vcpu->arch\.efer & EFER_SVME\)\s*\n"
+        r"\s*svm_clr_intercept\(svm, INTERCEPT_CPUID\);\s*\n"
+        r"\s*else\s*\n"
+        r"\s*svm_set_intercept\(svm, INTERCEPT_CPUID\);",
+        added_text,
+    )
+    nested_l1_efer = re.findall(
+        r"if \(is_guest_mode\(vcpu\)\)\s*\n"
+        r"\s*svme = svm->vmcb01\.ptr->save\.efer & EFER_SVME;",
+        added_text,
+    )
+    nested_leaf0 = re.findall(
+        r"case SVM_EXIT_CPUID:\s*\n"
+        r"[\s\S]{0,800}?"
+        r"if \(kvm_rax_read\(vcpu\) == 0\)\s*\n"
+        r"\s*return NESTED_EXIT_HOST;",
+        added_text,
+    )
+    nested_leaf0_fastpath = re.findall(
+        r"static fastpath_t handle_fastpath_nested_cpuid0"
+        r"[\s\S]{0,2000}?kvm_pmu_is_fastpath_emulation_allowed\(vcpu\)"
+        r"[\s\S]{0,500}?kvm_is_cpuid_allowed\(vcpu\)"
+        r"[\s\S]{0,1000}?EXIT_FASTPATH_REENTER_GUEST;",
+        added_text,
+    )
+    nested_leaf0_cache = re.findall(
+        r"entry = kvm_find_cpuid_entry\(vcpu, 0\);"
+        r"[\s\S]{0,800}?svm->cpuid0\.valid = true;",
+        added_text,
+    )
+    nested_leaf0_short_reentry = all(marker in added_text for marker in (
+        "static __always_inline bool svm_vcpu_exit_request",
+        "xfer_to_guest_mode_prepare();",
+        "aavm_nested_cpuid0_reenter:",
+        "svm_vcpu_exit_request(vcpu)",
+        "goto aavm_nested_cpuid0_reenter;",
+    ))
+    nested_leaf0_direct_skip = re.findall(
+        r"static fastpath_t handle_fastpath_nested_cpuid0"
+        r"[\s\S]{0,2500}?X86_EFLAGS_TF"
+        r"[\s\S]{0,1200}?kvm_rip_write\(vcpu, control->next_rip\);"
+        r"[\s\S]{0,500}?control->int_state &= ~SVM_INTERRUPT_SHADOW_MASK;",
+        added_text,
+    )
+    nested_leaf0_deferred_tail = all(marker in added_text for marker in (
+        "svm_can_defer_nested_cpuid0_exit_tail",
+        "control->exit_int_info & SVM_EXITINTINFO_VALID",
+        "control->event_inj & SVM_EVTINJ_VALID",
+        "!kvm_event_needs_reinjection(vcpu)",
+        "nested_svm_virtualize_tpr(vcpu)",
+        "control->tlb_ctl == TLB_CONTROL_DO_NOTHING",
+        "msr_write_intercepted(svm, MSR_AMD64_PERF_CNTR_GLOBAL_CTL)",
+        "kvm_clear_available_registers(vcpu, SVM_REGS_LAZY_LOAD_SET)",
+        "aavm_nested_cpuid0_finish_full_tail:",
+    ))
+    nested_db_direct_reflection = re.findall(
+        r"exit_code == SVM_EXIT_EXCP_BASE \+ DB_VECTOR"
+        r"[\s\S]{0,500}?vmcb12_is_intercept\(&svm->nested\.ctl, exit_code\)"
+        r"[\s\S]{0,900}?kvm_deliver_exception_payload\(vcpu, &db\);"
+        r"[\s\S]{0,500}?nested_svm_vmexit\(svm\);"
+        r"\s*return NESTED_EXIT_DONE;",
+        added_text,
+    )
+    nested_npf_value_cache = any(marker in added_text for marker in (
+        "nested_svm_cache_nonpresent_npf",
+        "nested_svm_try_cached_npf_exit",
+        "npf_cache[4]",
+    ))
+    vmcb12_map_reuse = all(marker in added_text for marker in (
+        "struct kvm_host_map vmcb12_map;",
+        "nested_svm_release_vmcb12_map",
+        "svm->nested.vmcb12_map_generation != generation",
+        "map->gfn != gpa_to_gfn(svm->nested.vmcb12_gpa)",
+    ))
+    problems = []
+    if len(recalc_gated) != 1 or len(init_gated) != 1:
+        problems.append("必須在 recalc 與 init_vmcb 都以 EFER.SVME 控制 VMCB01 CPUID intercept")
+    if len(nested_l1_efer) != 1:
+        problems.append("nested active 時必須使用 VMCB01 保存的 L1 EFER.SVME")
+    if len(nested_leaf0) != 1:
+        problems.append("必須保留 nested L2 CPUID leaf 0 的 L0 fallback handler")
+    if len(nested_leaf0_fastpath) != 1:
+        problems.append("必須以 PMU/CPUID-fault safe IRQ-off fastpath 處理 nested leaf 0")
+    if len(nested_leaf0_cache) != 1:
+        problems.append("必須在 set_cpuid 後預先快取 leaf 0，不得在 IRQ-off 路徑查表")
+    if not nested_leaf0_short_reentry:
+        problems.append("必須保留 request boundary 的 SVM nested leaf-0 short re-entry")
+    if len(nested_leaf0_direct_skip) != 1:
+        problems.append("nested leaf 0 必須以 TF/PMU guard 直接提交 NRIPS 與 interrupt-shadow")
+    if not nested_leaf0_deferred_tail:
+        problems.append("必須保留事件/PMU/TLB guard 與完整狀態回存的 leaf-0 deferred exit-tail")
+    if len(nested_db_direct_reflection) != 1:
+        problems.append("必須保留 debugger/NMI fallback 的 nested #DB 同輪直接反射")
+    if nested_npf_value_cache:
+        problems.append("不得保留已量測為負收益的 nested NPF value cache")
+    if not vmcb12_map_reuse:
+        problems.append("必須保留單次 nested run、generation-checked 的 VMCB12 map reuse")
+    if not re.search(r"trace_kvm_cpuid\(0, (?:index|kvm_ecx_read\(vcpu\))", added_text) or \
+            "EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_cpuid);" not in added_text:
+        problems.append("必須匯出並保留 kvm_cpuid tracepoint，以驗證 fastpath 實際命中")
+    if len(added_cpuid) != 4:
+        problems.append("CPUID intercept 變更數量不符 Linux 7.2 policy")
+    if re.search(
+        r"(?:vmcb02|nested_vmcb02|nested\.save\.cpl|save\.cpl).*"
+        r"(?:INTERCEPT_CPUID|CPUID)",
+        added_text,
+        re.IGNORECASE | re.DOTALL,
+    ) or re.search(
+        r"vmcb_(?:set|clr)_intercept\([^\n]*INTERCEPT_CPUID",
+        added_text,
+    ):
+        problems.append("nested VMCB02 不得改寫 CPUID intercept，必須保留 L0/L1 merged ownership")
+    if "kvm_rax_read(vcpu) == 0" in added_text and "kvm_emulate_cpuid(vcpu)" in added_text:
+        problems.append("不得在 svm_handle_exit 繞過 L1 的 nested CPUID exit")
+    if "kvm_hv_hypercall_enabled(vcpu)" in added_text:
+        problems.append("不得依賴 L2 Hyper-V hypercall state")
+    if "svm_is_intercept" in added_text:
+        problems.append("不得加入動態 CPUID intercept 探測")
+    if problems:
+        raise AppError(
+            f"核心補丁 {patch.name} 的 CPUID intercept 路徑不符合 Linux 7.2 policy："
+            + "；".join(problems)
+        )
+    dynamic_markers = (
+        "KVM_AAVM_NATIVE_CPUID_PORT",
+        "KVM_AAVM_NATIVE_CPUID_MAGIC",
+        "native_cpuid_active",
+        "ExitBootServices",
+    )
+    present = [marker for marker in dynamic_markers if marker in text]
+    if present:
+        raise AppError(
+            f"核心補丁 {patch.name} 仍包含動態 CPUID 切換："
+            + ", ".join(present)
+        )
 
 
 def _kernel_signing_hook() -> str:
@@ -215,6 +536,72 @@ def _installed_nvidia_drivers(runner: Runner) -> list[tuple[str, str]]:
     return sorted(set(drivers))
 
 
+def _patch_nvidia_dkms_for_linux_72() -> list[Path]:
+    """Port the NVIDIA 595.x process-name helper to Linux 7.2.
+
+    Linux 7.2 no longer declares the deprecated kernel ``strncpy`` helper.
+    NVIDIA 595.84 still calls it, so DKMS fails before the custom kernel
+    package can finish configuring.  Keep this narrowly scoped to the exact
+    call and preserve the vendor source metadata for package updates.
+    """
+    replacements = {
+        "nvidia/os-interface.c": (
+            ("strncpy(buf, current->comm, len - 1);", "strscpy(buf, current->comm, len);"),
+        ),
+        "nvidia/linux_nvswitch.c": (
+            (
+                "strncpy(regkey_val, regkey_val_start, regkey_val_len);",
+                "strscpy(regkey_val, regkey_val_start, regkey_val_len + 1);",
+            ),
+            ("return strncpy(dest, src, length);", "strscpy(dest, src, length); return dest;"),
+        ),
+        "nvidia-modeset/nvidia-modeset-linux.c": (
+            ("return strncpy(dest, src, n);", "strscpy(dest, src, n); return dest;"),
+        ),
+        "nvidia-uvm/uvm_pmm_gpu.c": (
+            (
+                'strncpy(chunk_split_cache[level].name, "uvm_gpu_chunk_t", '
+                'sizeof(chunk_split_cache[level].name) - 1);',
+                'strscpy(chunk_split_cache[level].name, "uvm_gpu_chunk_t", '
+                'sizeof(chunk_split_cache[level].name));',
+            ),
+        ),
+    }
+    patched: list[Path] = []
+    for source in sorted(NVIDIA_DKMS_SOURCE_ROOT.glob("nvidia-*")):
+        for relative, entries in replacements.items():
+            target = source / relative
+            if not target.is_file():
+                continue
+            text = target.read_text(encoding="utf-8", errors="replace")
+            updated = text
+            for old, new in entries:
+                updated = updated.replace(old, new, 1)
+            if updated == text:
+                continue
+            backup = target.with_name(f"{target.name}.kvm-aavm.orig")
+            if not backup.exists():
+                shutil.copy2(target, backup)
+            stat = target.stat()
+            fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(updated)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(temporary, stat.st_mode & 0o7777)
+                try:
+                    os.chown(temporary, stat.st_uid, stat.st_gid)
+                except PermissionError:
+                    pass
+                os.replace(temporary, target)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            patched.append(target)
+    return patched
+
+
 def _package_installed(runner: Runner, package: str) -> bool:
     result = runner.run(
         ["dpkg-query", "-W", "-f=${db:Status-Abbrev}", package],
@@ -346,17 +733,60 @@ def sign_custom_kernels(runner: Runner) -> None:
         print("請重新開機並在 MOK Manager 完成 Enroll MOK 後，才能由 Secure Boot 啟動。")
 
 
-def build_kernel(runner: Runner) -> None:
+def _prepare_kernel_mirror(runner: Runner, source: Path, mirror: Path, tag: str) -> None:
+    """Create the local mirror linux-tkg expects, including tarball sources."""
+    if (source / ".git").is_dir():
+        runner.run(["git", "clone", "--bare", str(source), str(mirror)])
+        runner.run(["git", "--git-dir", str(mirror), "tag", "-f", tag])
+        return
+    runner.run(["git", "init", "--bare", str(mirror)])
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "KVM-AAVM offline source",
+        "GIT_AUTHOR_EMAIL": "kvm-aavm@localhost",
+        "GIT_COMMITTER_NAME": "KVM-AAVM offline source",
+        "GIT_COMMITTER_EMAIL": "kvm-aavm@localhost",
+    }
+    runner.run([
+        "git", "--git-dir", str(mirror), "--work-tree", str(source), "add", "-A",
+    ], env=env)
+    runner.run([
+        "git", "--git-dir", str(mirror), "--work-tree", str(source),
+        "commit", "--allow-empty", "-m", f"Import offline Linux source {tag}",
+    ], env=env)
+    runner.run(["git", "--git-dir", str(mirror), "tag", "-f", tag], env=env)
+
+
+def build_kernel(runner: Runner, profile_key: str = "stable") -> None:
     require_root()
+    profile = kernel_profile(profile_key)
     source = OFFLINE_DIR / "sources/linux-tkg"
-    linux = OFFLINE_DIR / "sources/linux"
-    if not source.is_dir() or not linux.is_dir():
-        raise AppError("Offline linux-tkg/Linux source is missing.")
-    work = STATE_DIR / "kernel-build/linux-tkg"
+    linux = OFFLINE_DIR / profile.source_relpath
+    if not source.is_dir():
+        raise AppError(f"Offline linux-tkg source is missing: {source}")
+    if not linux.is_dir():
+        if profile.test_release:
+            raise AppError(
+                f"找不到 Linux 7.2.2 測試核心離線 source：{linux}。"
+                "請在準備部署包的連網 Ubuntu 上執行 tools/prepare_offline.sh，"
+                "再把完整 offline 目錄帶到這台機器。"
+            )
+        raise AppError(f"Offline Linux source is missing: {linux}")
+    _validate_kernel_source(profile, linux)
+    patch = _kernel_patch(profile)
+    _validate_hypercall_patch(patch)
+    if profile.test_release and patch.name.startswith("amd"):
+        _validate_amd_cpuid_virtualization_patch(patch)
+    work = STATE_DIR / f"kernel-build/{profile.key}"
     if work.exists():
         shutil.rmtree(work)
     shutil.copytree(source, work, symlinks=True)
-    shutil.copytree(linux, work / "linux-src-git", symlinks=True)
+    # Keep the source immutable and make a local bare mirror for linux-tkg's
+    # offline worktree setup.  This also imports tarball sources without
+    # requiring a .git directory and prevents any network fetch.
+    _, source_tag = _kernel_source_metadata(linux)
+    mirror_tag = source_tag if profile.test_release else "v6.19"
+    _prepare_kernel_mirror(runner, linux, work / "linux-kernel.git", mirror_tag or profile.tkg_version)
     secure_boot = _secure_boot_enabled(runner)
     if secure_boot:
         _ensure_kernel_mok(runner)
@@ -364,8 +794,11 @@ def build_kernel(runner: Runner) -> None:
     cfg = work / "customization.cfg"
     text = cfg.read_text(encoding="utf-8")
     options = {
-        "_distro": "Ubuntu", "_version": "6.19-latest", "_menunconfig": "false",
+        "_distro": "Ubuntu", "_version": profile.tkg_version, "_offline": "true",
+        "_menunconfig": "false",
         "_diffconfig": "false", "_cpusched": "eevdf", "_compiler": "gcc",
+        "_processor_opt": "native", "_timer_freq": "1000", "_tickless": "2",
+        "_acs_override": "false",
         "_install_after_building": "no", "_user_patches_no_confirm": "true",
         "_config_fragments_no_confirm": "true",
     }
@@ -375,17 +808,38 @@ def build_kernel(runner: Runner) -> None:
     (work / "kvm-aavm-ubuntu.myfrag").write_text(
         _ubuntu_kernel_fragment(), encoding="utf-8",
     )
-    patch = PROJECT_DIR / ("amd619.mypatch" if cpu_info()["vendor"] == "amd" else "intel619.mypatch")
-    patch_dir = work / "linux619-tkg-userpatches"
+    patch_dir = work / profile.patch_dirname
     patch_dir.mkdir(exist_ok=True)
     shutil.copy2(patch, patch_dir / patch.name)
     runner.run(["bash", "install.sh", "install"], cwd=work, env={**os.environ, "_distro": "Ubuntu"})
     debs = sorted((work / "DEBS").glob("*.deb"))
     if not debs:
         raise AppError("linux-tkg did not produce Ubuntu DEB packages.")
-    runner.run(["apt-get", "install", "-y", *debs])
-    for image in sorted(BOOT_DIR.glob("vmlinuz-*-tkg-*")):
-        _validate_tkg_boot_config(image.name.removeprefix("vmlinuz-"))
+    if profile.test_release:
+        patched = _patch_nvidia_dkms_for_linux_72()
+        if patched:
+            print("已套用 Linux 7.2 的 NVIDIA DKMS strscpy 相容修補：")
+            for path in patched:
+                print(f"  - {path}")
+    # Rebuilds can produce an older Debian revision for the same kernel ABI.
+    # These are explicit local artifacts, so allow APT to replace a newer
+    # installed revision with the requested build instead of failing under
+    # its default downgrade protection.
+    runner.run([
+        "apt-get", "install", "-y", "--reinstall", "--allow-downgrades",
+        "--allow-change-held-packages", *debs,
+    ])
+    # Validate exactly the non-debug image package produced by this build.
+    # Older recovery kernels can intentionally have a different LSM policy and
+    # must not make an otherwise valid new profile fail after APT installed it.
+    image_debs = [
+        deb for deb in debs
+        if deb.name.startswith("linux-image-") and "-dbg_" not in deb.name
+    ]
+    if len(image_debs) != 1:
+        raise AppError("linux-tkg 產物無法唯一辨識非 debug 核心映像套件。")
+    built_version = image_debs[0].name.split("_", 1)[0].removeprefix("linux-image-")
+    _validate_tkg_boot_config(built_version)
     if secure_boot:
         _sign_installed_tkg_kernels(runner)
     _prepare_tkg_external_modules(runner, secure_boot)
@@ -393,6 +847,29 @@ def build_kernel(runner: Runner) -> None:
         _queue_kernel_mok_enrollment(runner)
     runner.run(["update-initramfs", "-u", "-k", "all"])
     runner.run(["update-grub"])
+    print(f"已建置並安裝 {profile.label}。穩定 Ubuntu 核心仍保留為回復入口。")
+
+
+def cleanup_kernel_build(runner: Runner, profile_key: str = "test-7.2") -> None:
+    """Remove completed kernel source worktrees while retaining recovery DEBs."""
+    require_root()
+    profile = kernel_profile(profile_key)
+    work = STATE_DIR / f"kernel-build/{profile.key}"
+    targets = [work / "linux-src-git", work / "linux-kernel.git"]
+    existing = [path for path in targets if path.is_dir()]
+    if not existing:
+        print(f"沒有可清理的 {profile.label} 建置 source。")
+        return
+    print("將刪除以下已完成建置的暫存 source/mirror（保留 DEBS 與已安裝核心）：")
+    for path in existing:
+        print(f"  - {path}")
+    if not prompt_yes_no("確認清理這些建置暫存", False):
+        print("已取消清理。")
+        return
+    for path in existing:
+        shutil.rmtree(path)
+    runner.run(["apt-get", "clean"])
+    print("核心建置暫存已清理；DEBS、DKMS、/boot 核心與離線 source 均保留。")
 
 
 def install_memflow(runner: Runner) -> None:

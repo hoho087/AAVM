@@ -10,7 +10,10 @@ from pathlib import Path
 
 from . import __version__
 from .build import build_all
-from .hardware import PciDevice, UsbDevice, gpu_groups, host_fingerprint, pci_devices, print_preflight, usb_devices
+from .hardware import (
+    PciDevice, UsbDevice, gpu_groups, host_fingerprint, pci_devices,
+    print_preflight, usb_devices,
+)
 from .hooks import (
     install_dynamic_hooks, install_performance_hook, install_single_gpu_hooks, recover_single_gpu,
     remove_dynamic_hooks, remove_single_gpu_hooks,
@@ -20,15 +23,18 @@ from .host import (
     install_application, install_pending_service,
 )
 from .identity import rerandomize
-from .kernel import build_kernel, install_memflow, sign_custom_kernels
+from .kernel import build_kernel, cleanup_kernel_build, install_memflow, sign_custom_kernels
 from .offline import install_packages, print_validation
 from .paths import PENDING_DIR, PROJECT_DIR, VM_DIR, ensure_state_dirs
 from .state import clear_pending, load_host_state, load_profile, mark_pending, pending_names, save_profile, vm_lock
 from .util import AppError, Runner, prompt, prompt_int, prompt_yes_no, require_root, valid_vm_name
 from .vm import (
-    configure_cpu_layout, configure_guest_security, configure_minimal_devices, configure_passthrough, create_vm, enable_devirtualized,
+    configure_cpu_layout, configure_guest_security, configure_hugepages, configure_tpm,
+    configure_minimal_devices, configure_passthrough, create_vm, enable_devirtualized,
     enable_gpu_setup, finalize_vm,
-    new_profile, randomize_all, randomize_xml, resume_vm, set_dynamic,
+    align_host_board_identity, cleanup_vm_artifacts, disable_passthrough, new_profile, purge_vm,
+    export_host_secure_boot, randomize_all, randomize_xml, rebuild_artifacts, recreate_tpm, resume_vm, set_dynamic,
+    tpm_config_from_xml,
 )
 from .xmlgen import validate_required
 
@@ -118,8 +124,42 @@ def _choose_indices(label: str, count: int, defaults: list[int] | None = None) -
             continue
         return sorted(selected)
 
+def _validate_iommu_isolation(
+    chosen: list[PciDevice], all_devices: list[PciDevice], label: str,
+) -> None:
+    """Reject a passthrough handoff that cannot be completed as one IOMMU unit."""
+    missing = [device.address for device in chosen if device.iommu_group is None]
+    if missing:
+        raise AppError(
+            f"{label} has no IOMMU group (" + ", ".join(missing) + "). "
+            "Enable IOMMU/AMD-Vi in firmware before PCI passthrough."
+        )
+
+    selected = {device.address for device in chosen}
+    groups = {device.iommu_group for device in chosen}
+    companions = [
+        device for device in all_devices
+        if device.iommu_group in groups and device.address not in selected
+    ]
+    if companions:
+        details = ", ".join(
+            f"{device.address} {device.description}" for device in companions
+        )
+        raise AppError(
+            f"{label} does not occupy an isolated IOMMU group; handing it "
+            f"off would fail after the host display is stopped. Group companions: {details}"
+        )
+
+
+def _validate_gpu_iommu_isolation(
+    chosen: list[PciDevice], all_devices: list[PciDevice],
+) -> None:
+    _validate_iommu_isolation(chosen, all_devices, "Selected GPU")
+
+
 def _select_gpu() -> list[PciDevice]:
-    groups = gpu_groups(pci_devices())
+    devices = pci_devices()
+    groups = gpu_groups(devices)
     if not groups:
         raise AppError("No display controller was detected by lspci.")
     for index, group in enumerate(groups, 1):
@@ -130,6 +170,7 @@ def _select_gpu() -> list[PciDevice]:
     chosen = groups[choice - 1]
     if not any(d.class_code.startswith("03") for d in chosen):
         raise AppError("The selected functions do not contain a GPU display controller.")
+    _validate_gpu_iommu_isolation(chosen, devices)
     print("此 PCI slot 的全部功能都會由單 GPU hook 從 Ubuntu 安全解綁。")
     return chosen
 
@@ -170,7 +211,10 @@ def _select_additional_pci(excluded: set[str], current: set[str] | None = None, 
         _print_pci(index, device)
     defaults = [index for index, device in enumerate(devices, 1) if device.address in (current or set())]
     selected = _choose_indices("輸入 PCI 裝置編號（可用 1,3,5-7；0=不選）", len(devices), defaults)
-    return [devices[index - 1] for index in selected]
+    chosen = [devices[index - 1] for index in selected]
+    if chosen:
+        _validate_iommu_isolation(chosen, pci_devices(), "Selected PCI device")
+    return chosen
 
 
 
@@ -346,6 +390,17 @@ def devirtualize_creation(name: str, runner: Runner) -> None:
         raise AppError("核心隔離／VBS 需要同時啟用 Guest UEFI Secure Boot。")
     if guest_core_isolation:
         ensure_nested_virtualization(runner)
+    guest_hyperv_enlightenments = False
+    if guest_core_isolation:
+        previous_core_isolation = bool(profile.get("guest_core_isolation", False))
+        hyperv_default = (
+            bool(profile.get("guest_hyperv_enlightenments", False))
+            if previous_core_isolation else True
+        )
+        guest_hyperv_enlightenments = prompt_yes_no(
+            "啟用 HVCI nested Hyper-V 效能加速（direct stimer、TLB flush；AMD 支援時含 GMET）",
+            hyperv_default,
+        )
     _leave_single_gpu_stage(name, profile, runner)
     enable_devirtualized(
         name, runner,
@@ -354,6 +409,7 @@ def devirtualize_creation(name: str, runner: Runner) -> None:
         guest_secure_boot=guest_secure_boot,
         guest_dma_protection=guest_dma_protection,
         guest_core_isolation=guest_core_isolation,
+        guest_hyperv_enlightenments=guest_hyperv_enlightenments,
     )
     install_performance_hook(name)
     print(f"{name}: 去虛擬化設定已啟用。")
@@ -371,6 +427,8 @@ def devirtualize_creation(name: str, runner: Runner) -> None:
     print(f"Guest UEFI Secure Boot：{'已啟用' if guest_secure_boot else '未啟用'}。")
     if guest_core_isolation:
         print("Windows 核心隔離／VBS 已啟用；guest 會看到 SVM/VMX，並可能觸發 timing anomaly 偵測。")
+        if guest_hyperv_enlightenments:
+            print("nested Hyper-V 效能加速已啟用；這改善巢狀虛擬化執行成本，不會偽造或保證消除 timing anomaly。")
     else:
         print("Windows 核心隔離／VBS 已關閉；guest SVM/VMX 繼續隱藏。")
     print("VNC/VGA 與虛擬網路仍保留，PCI/USB/GPU 直通尚未啟用。")
@@ -621,8 +679,9 @@ def _identity_wizard(runner: Runner) -> None:
     print("[1] 動態隨機化開關（VM 每次關機後更新 XML）")
     print("[2] 立即僅隨機化 XML 身份")
     print("[3] 立即全部隨機化（XML + 重建 QEMU/OVMF patch）")
+    print("[4] 對齊實體主機板（Secure Boot OEM 金鑰）")
     print("[0] 返回")
-    choice = prompt_int("選擇身份操作", 1, 0, 3)
+    choice = prompt_int("選擇身份操作", 1, 0, 4)
     if choice == 0:
         return
     if choice == 1:
@@ -639,8 +698,10 @@ def _identity_wizard(runner: Runner) -> None:
             remove_dynamic_hooks(name)
     elif choice == 2:
         randomize_xml(name, runner)
-    else:
+    elif choice == 3:
         randomize_all(name, runner)
+    else:
+        align_host_board_identity(name, runner)
 
 
 def _diagnostics() -> None:
@@ -668,6 +729,7 @@ def _guest_security_wizard(runner: Runner) -> None:
     name = valid_vm_name(prompt("VM 名稱"))
     profile = load_profile(name)
     print("此功能會保留 Windows Boot Manager、直通設備與目前 VM 階段。")
+    print("啟用 Secure Boot 時會鏡像主機目前 active keys、保留 factory defaults，並移除 guest Custom keys。")
     print("核心 DMA 保護使用 DMAR platform opt-in，不會強制開啟曾造成卡機的 interrupt remapping。")
     secure_boot = prompt_yes_no(
         "啟用 Guest UEFI Secure Boot",
@@ -688,10 +750,61 @@ def _guest_security_wizard(runner: Runner) -> None:
         if not secure_boot:
             raise AppError("核心隔離／VBS 需要同時啟用 Guest UEFI Secure Boot。")
         ensure_nested_virtualization(runner)
+    hyperv_enlightenments = False
+    if core_isolation:
+        previous_core_isolation = bool(profile.get("guest_core_isolation", False))
+        hyperv_default = (
+            bool(profile.get("guest_hyperv_enlightenments", False))
+            if previous_core_isolation else True
+        )
+        hyperv_enlightenments = prompt_yes_no(
+            "啟用 HVCI nested Hyper-V 效能加速（direct stimer、TLB flush；AMD 支援時含 GMET）",
+            hyperv_default,
+        )
     configure_guest_security(
         name, secure_boot, dma_protection, runner,
         core_isolation=core_isolation,
+        guest_hyperv_enlightenments=hyperv_enlightenments,
     )
+
+
+def _tpm_wizard(runner: Runner) -> None:
+    require_root()
+    name = valid_vm_name(prompt("VM 名稱"))
+    profile = load_profile(name)
+    current_config = dict(profile.get("tpm", {}))
+    current = str(current_config.get("mode", "none"))
+    # Prefer the inactive domain definition for display only.  This detects
+    # TPMs previously added with virt-manager without changing the profile
+    # until the user explicitly confirms a mode below.
+    result = runner.run(
+        ["virsh", "dumpxml", "--inactive", name], check=False, capture=True,
+    )
+    if result.returncode == 0:
+        try:
+            xml_tpm = tpm_config_from_xml(result.stdout)
+        except ET.ParseError:
+            xml_tpm = None
+        current_config = xml_tpm or {"mode": "none"}
+        current = str(current_config.get("mode", "none"))
+    print("TPM backend 變更需要 VM 完全關機，並會保留 XML、磁碟與 Windows 開機項目。")
+    print(f"目前模式：{current}")
+    current_profile = str(current_config.get("profile", "generic"))
+    print("[1] AMD-profiled software TPM 2.0（patched libtpms + tpm-crb）")
+    print("[2] 一般持久 vTPM 2.0（swtpm；不使用主機 TPM）")
+    print("[3] 移除 TPM 裝置")
+    print("[4] 重製目前 TPM 身分（會觸發 BitLocker／Windows Hello 復原或重新註冊）")
+    default = 1 if current_profile == "amd-ftpm" else 2 if current == "emulator" else 3
+    choice = prompt_int("選擇 TPM 模式", default, 1, 4)
+    if choice == 4:
+        print("原 TPM state 會先備份，再從 libvirt 活動路徑移出；Secure Boot、磁碟與 XML 不會變更。")
+        if not prompt_yes_no("確認重製 TPM 身分", False):
+            print(f"{name}: 已取消 TPM 重製。")
+            return
+        recreate_tpm(name, runner, confirmed=True)
+        return
+    mode = {1: "amd-ftpm", 2: "emulator", 3: "none"}[choice]
+    configure_tpm(name, mode, runner)
 
 
 def _maintenance_menu(runner: Runner) -> None:
@@ -701,9 +814,15 @@ def _maintenance_menu(runner: Runner) -> None:
         ("納管現有 VM", lambda: adopt_vm(prompt("VM 名稱"), runner)),
         ("虛擬設備／libvirt 虛擬網卡開關", lambda: _minimal_devices_wizard(runner)),
         ("Guest Secure Boot／核心 DMA 保護／核心隔離", lambda: _guest_security_wizard(runner)),
-        ("CPU SMT 拓撲／綁核／主機電源效能模式", lambda: _performance_wizard(runner)),
+        ("vTPM 管理", lambda: _tpm_wizard(runner)),
+        ("CPU SMT 拓撲／綁核／2 MiB Hugepages／主機電源效能模式", lambda: _performance_wizard(runner)),
         ("恢復主機顯示／重新綁定單 GPU", lambda: recover_display(prompt("VM 名稱"), runner)),
         ("驗證 VM XML 必要設定", lambda: validate_vm_xml(prompt("VM 名稱"), runner)),
+        ("重建目前 VM 的 QEMU／OVMF 工件（保留 XML 身份）", lambda: rebuild_artifacts(prompt("VM 名稱"), runner)),
+        ("清理 VM 舊 QEMU／OVMF 產物與 build 暫存", lambda: cleanup_vm_artifacts(prompt("VM 名稱"), runner)),
+        ("移除 VM 直通並恢復 VNC/VGA 排查模式", lambda: disable_passthrough(prompt("VM 名稱"), runner)),
+        ("完全移除 VM 及所有本地產物（不可復原）", lambda: purge_vm(prompt("VM 名稱"), runner)),
+        ("清理已完成的 7.2 核心建置暫存（保留套件）", lambda: cleanup_kernel_build(runner)),
         ("只安裝／更新部署器與服務", lambda: install_app_stack(runner)),
     ]
     while True:
@@ -736,6 +855,14 @@ def _performance_wizard(runner: Runner) -> None:
     )
     if threads == 2 and vcpus % 2:
         raise AppError("SMT 拓撲需要偶數 vCPU。")
+    hugepages = prompt_yes_no(
+        "使用 2 MiB hugepages（預留 VM RAM；需要 VM 關機後套用）",
+        bool(profile.get("resources", {}).get("hugepages_2m", False)),
+    )
+    if hugepages != bool(profile.get("resources", {}).get("hugepages_2m", False)):
+        # Reserve pages before any topology change so an insufficient-memory
+        # failure leaves the existing VM definition untouched.
+        configure_hugepages(name, hugepages, runner)
     configure_cpu_layout(name, vcpus, runner)
     install_performance_hook(name)
     print("電源效能 hook 已安裝：VM 啟動時切換 performance，最後一台管理中 VM 停止後復原。")
@@ -746,12 +873,15 @@ def _custom_kernel_wizard(runner: Runner) -> None:
     print("\n自訂核心")
     print("[1] 建置並安裝新的 linux-tkg 自訂核心")
     print("[2] 修復／驗證現有自訂核心的 Secure Boot 簽章（不重新編譯）")
+    print("[3] 建置 Linux 7.2.2 實驗核心（HVCI/VBS 效能測試；需要離線 source 與已 port 補丁）")
     print("[0] 返回主選單")
-    choice = prompt_int("選擇功能", 1, 0, 2)
+    choice = prompt_int("選擇功能", 1, 0, 3)
     if choice == 1:
         build_kernel(runner)
     elif choice == 2:
         sign_custom_kernels(runner)
+    elif choice == 3:
+        build_kernel(runner, "test-7.2")
 
 
 def menu(runner: Runner) -> None:
@@ -788,7 +918,15 @@ def _minimal_devices_wizard(runner: Runner) -> None:
     print("啟用精簡模式會移除：PS/2 鍵鼠、QEMU audio backend，及未被 USB 直通使用的 xHCI controller。")
     print("保留：磁碟、SATA/PCI root、OVMF、IOMMU，以及 Windows 安裝階段需要的 SPICE/VGA。")
     enabled = prompt_yes_no("啟用精簡 QEMU 虛擬設備", current)
-    if enabled and not profile.get("passthrough", {}).get("usb"):
+    passthrough = profile.get("passthrough", {})
+    passed_pci = {str(address).lower() for address in passthrough.get("pci", [])}
+    passed_usb_controller = any(
+        str(device.get("address", "")).lower() in passed_pci
+        and str(device.get("class_code", "")).lower().startswith("0c03")
+        for device in profile.get("host", {}).get("pci", [])
+    )
+    has_guest_input_path = bool(passthrough.get("usb")) or passed_usb_controller
+    if enabled and not has_guest_input_path:
         print("警告：此 VM 沒有記錄 USB 直通；移除 PS/2 後可能無法操作 guest。")
         if not prompt_yes_no("確認仍要套用", False):
             print("已取消。")
@@ -822,14 +960,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Ubuntu 24.04 offline KVM-AntiAntiVM deployer")
     parser.add_argument("--dry-run", action="store_true", help="print commands without changing the host")
     sub = parser.add_subparsers(dest="command")
-    for command in ("preflight", "status", "bootstrap", "validate-offline", "install-offline", "configure-host", "install-app", "create-vm", "build-kernel", "sign-custom-kernels", "install-memflow", "randomize-pending"):
+    for command in ("preflight", "status", "bootstrap", "validate-offline", "install-offline", "configure-host", "install-app", "create-vm", "build-kernel", "build-kernel-test", "cleanup-kernel-build", "sign-custom-kernels", "install-memflow", "randomize-pending"):
         sub.add_parser(command)
-    for command in ("resume-vm", "devirtualize-vm", "one-click-passthrough", "enable-gpu", "finalize-vm", "adopt-vm", "configure-passthrough", "recover-display", "randomize-xml", "randomize-all", "mark-pending", "validate-xml"):
+    for command in ("resume-vm", "devirtualize-vm", "one-click-passthrough", "enable-gpu", "finalize-vm", "adopt-vm", "configure-passthrough", "recover-display", "randomize-xml", "randomize-all", "align-host-board", "rebuild-artifacts", "cleanup-vm-artifacts", "disable-passthrough", "purge-vm", "mark-pending", "validate-xml"):
         item = sub.add_parser(command)
         item.add_argument("--vm", required=True)
+    tpm = sub.add_parser("configure-tpm")
+    tpm.add_argument("--vm", required=True)
+    tpm.add_argument("--mode", required=True, choices=("none", "emulator", "amd-ftpm"))
+    recreate = sub.add_parser(
+        "recreate-tpm",
+        help="retire the current persistent vTPM state and manufacture a new identity",
+    )
+    recreate.add_argument("--vm", required=True)
+    recreate.add_argument(
+        "--confirm", action="store_true",
+        help="acknowledge that the guest TPM identity and TPM-bound secrets will change",
+    )
     performance = sub.add_parser("configure-performance")
     performance.add_argument("--vm", required=True)
     performance.add_argument("--vcpus", required=True, type=int)
+    performance.add_argument("--hugepages", action=argparse.BooleanOptionalAction, default=None)
     minimal = sub.add_parser("set-minimal-devices")
     minimal.add_argument("--vm", required=True)
     minimal.add_argument("--enable", action=argparse.BooleanOptionalAction, default=True)
@@ -842,6 +993,12 @@ def build_parser() -> argparse.ArgumentParser:
     security.add_argument("--secure-boot", action=argparse.BooleanOptionalAction, default=True)
     security.add_argument("--dma-protection", action=argparse.BooleanOptionalAction, default=True)
     security.add_argument("--core-isolation", action=argparse.BooleanOptionalAction, default=None)
+    security.add_argument("--hyperv-enlightenments", action=argparse.BooleanOptionalAction, default=None)
+    export_secure_boot = sub.add_parser(
+        "export-host-secure-boot",
+        help="export active and factory host Secure Boot databases",
+    )
+    export_secure_boot.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -871,6 +1028,13 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "sign-custom-kernels": sign_custom_kernels(runner)
         elif command == "randomize-xml": randomize_xml(args.vm, runner)
         elif command == "randomize-all": randomize_all(args.vm, runner)
+        elif command == "align-host-board": align_host_board_identity(args.vm, runner)
+        elif command == "rebuild-artifacts": rebuild_artifacts(args.vm, runner)
+        elif command == "cleanup-vm-artifacts": cleanup_vm_artifacts(args.vm, runner)
+        elif command == "disable-passthrough": disable_passthrough(args.vm, runner)
+        elif command == "configure-tpm": configure_tpm(args.vm, args.mode, runner)
+        elif command == "recreate-tpm": recreate_tpm(args.vm, runner, confirmed=args.confirm)
+        elif command == "purge-vm": purge_vm(args.vm, runner)
         elif command == "mark-pending": mark_pending(args.vm)
         elif command == "randomize-pending": randomize_pending(runner)
         elif command == "set-minimal-devices":
@@ -894,11 +1058,19 @@ def main(argv: list[str] | None = None) -> int:
             configure_guest_security(
                 args.vm, args.secure_boot, args.dma_protection, runner,
                 core_isolation=args.core_isolation,
+                guest_hyperv_enlightenments=args.hyperv_enlightenments,
             )
+        elif command == "export-host-secure-boot":
+            output = export_host_secure_boot(args.output)
+            print(f"Exported active and factory host Secure Boot databases: {output}")
         elif command == "configure-performance":
+            if args.hugepages is not None:
+                configure_hugepages(args.vm, args.hugepages, runner)
             configure_cpu_layout(args.vm, args.vcpus, runner)
             install_performance_hook(args.vm)
         elif command == "build-kernel": build_kernel(runner)
+        elif command == "build-kernel-test": build_kernel(runner, "test-7.2")
+        elif command == "cleanup-kernel-build": cleanup_kernel_build(runner)
         elif command == "install-memflow": install_memflow(runner)
         elif command == "validate-xml": validate_vm_xml(args.vm, runner)
         return 0

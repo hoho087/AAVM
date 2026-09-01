@@ -17,12 +17,148 @@ INSTALL_OVMF_VARS = "/usr/share/OVMF/OVMF_VARS_4M.fd"
 ET.register_namespace("qemu", QEMU_NS)
 ET.register_namespace("kvm-aavm", AAVM_NS)
 
+HUGEPAGE_2M_KIB = 2048
+HYPERV_STANDARD_FEATURES = (
+    "relaxed", "vapic", "spinlocks", "vpindex", "runtime", "synic",
+    "stimer", "reset", "vendor_id", "frequencies", "reenlightenment",
+    "tlbflush", "ipi", "evmcs", "avic",
+)
+HYPERV_ACCELERATED_FEATURES = {
+    "relaxed", "vapic", "spinlocks", "vpindex", "runtime", "synic",
+    "stimer", "frequencies", "tlbflush", "ipi",
+}
+HYPERV_AMD_ACCELERATED_FEATURES = {"avic"}
+HYPERV_AMD_QEMU_GLOBALS = (
+    "host-x86_64-cpu.gmet=on",
+    "host-x86_64-cpu.hv-emsr-bitmap=on",
+    "host-x86_64-cpu.hv-tlbflush-ext=on",
+    "host-x86_64-cpu.hv-tlbflush-direct=on",
+)
+HYPERV_NESTED_MMU_QEMU_GLOBALS = (
+    # KVM's shadow MMU does not implement CET shadow-stack mappings.  A VBS
+    # guest creates a nested MMU, so do not advertise CET-SS to the outer
+    # Windows kernel while its Hyper-V enlightenments are active.
+    "host-x86_64-cpu.cet-ss=off",
+)
+TPM_MODELS = {"tpm-tis", "tpm-crb"}
+TPM_PROFILES = {"generic", "amd-ftpm"}
+
 
 def _sub(parent: ET.Element, tag: str, text: str | None = None, **attrs: str) -> ET.Element:
     element = ET.SubElement(parent, tag, attrs)
     if text is not None:
         element.text = str(text)
     return element
+
+
+def _tpm_settings(profile: dict) -> tuple[str, str, str]:
+    """Return the supported guest TPM configuration."""
+    value = profile.get("tpm", {})
+    if not isinstance(value, dict):
+        value = {}
+    mode = str(value.get("mode", "none"))
+    if mode not in {"none", "emulator"}:
+        raise AppError(f"Unsupported TPM mode: {mode}")
+    if mode == "none":
+        return mode, "", ""
+
+    model = str(value.get("model", "tpm-crb"))
+    if model not in TPM_MODELS:
+        raise AppError(f"Unsupported TPM model: {model}")
+    tpm_profile = str(value.get("profile", "generic"))
+    if tpm_profile not in TPM_PROFILES:
+        raise AppError(f"Unsupported TPM profile: {tpm_profile}")
+    if tpm_profile == "amd-ftpm" and model != "tpm-crb":
+        raise AppError("The AMD fTPM profile requires the tpm-crb interface.")
+    return mode, model, tpm_profile
+
+
+def amd_nested_hyperv_acceleration_available(profile: dict) -> bool:
+    host = profile.get("host", {})
+    cpu = host.get("cpu", {})
+    kvm = host.get("kvm", {})
+    return cpu.get("vendor") == "amd" and all(
+        bool(kvm.get(key, False)) for key in ("nested", "npt", "avic", "gmet")
+    )
+
+
+def amd_avic_available(profile: dict) -> bool:
+    """Return whether the host can expose Hyper-V AVIC independently of GMET."""
+    host = profile.get("host", {})
+    return (
+        host.get("cpu", {}).get("vendor") == "amd"
+        and bool(host.get("kvm", {}).get("avic", False))
+    )
+
+
+def _set_qemu_global(commandline: ET.Element, value: str, enabled: bool) -> None:
+    children = list(commandline)
+    remove: set[ET.Element] = set()
+    for index, child in enumerate(children):
+        if child.get("value") != value:
+            continue
+        remove.add(child)
+        if index and children[index - 1].get("value") == "-global":
+            remove.add(children[index - 1])
+    for child in remove:
+        commandline.remove(child)
+    if enabled:
+        _sub(commandline, f"{{{QEMU_NS}}}arg", value="-global")
+        _sub(commandline, f"{{{QEMU_NS}}}arg", value=value)
+
+
+def apply_hyperv_enlightenments(
+    root: ET.Element, enabled: bool, amd_acceleration: bool,
+    amd_avic: bool | None = None,
+) -> None:
+    """Configure coherent nested Hyper-V acceleration without duplicate -cpu args."""
+    features = root.find("features")
+    if features is None:
+        raise AppError("Domain XML has no features element for Hyper-V configuration.")
+    hyperv = features.find("hyperv")
+    if hyperv is None:
+        hyperv = _sub(features, "hyperv", mode="custom")
+    amd_avic = amd_acceleration if amd_avic is None else amd_avic
+    for name in HYPERV_STANDARD_FEATURES:
+        state = enabled and (
+            name in HYPERV_ACCELERATED_FEATURES
+            or (amd_avic and name in HYPERV_AMD_ACCELERATED_FEATURES)
+        )
+        element = hyperv.find(name)
+        if element is None:
+            element = _sub(hyperv, name)
+        element.set("state", "on" if state else "off")
+        if name == "spinlocks":
+            if state:
+                # libvirt requires retries whenever this Hyper-V feature is
+                # enabled. 8191 is the conventional Windows/KVM value.
+                element.set("retries", "8191")
+            else:
+                element.attrib.pop("retries", None)
+        if name == "stimer":
+            direct = element.find("direct")
+            if state:
+                if direct is None:
+                    direct = _sub(element, "direct")
+                direct.set("state", "on")
+            elif direct is not None:
+                element.remove(direct)
+
+    clock = root.find("clock")
+    if clock is None:
+        raise AppError("Domain XML has no clock element for Hyper-V configuration.")
+    hypervclock = clock.find("timer[@name='hypervclock']")
+    if hypervclock is None:
+        hypervclock = _sub(clock, "timer", name="hypervclock")
+    hypervclock.set("present", "yes" if enabled else "no")
+
+    commandline = root.find(f"{{{QEMU_NS}}}commandline")
+    if commandline is None:
+        commandline = _sub(root, f"{{{QEMU_NS}}}commandline")
+    for value in HYPERV_AMD_QEMU_GLOBALS:
+        _set_qemu_global(commandline, value, enabled and amd_acceleration)
+    for value in HYPERV_NESTED_MMU_QEMU_GLOBALS:
+        _set_qemu_global(commandline, value, enabled)
 
 
 def _qemu_escape(value: str) -> str:
@@ -142,6 +278,18 @@ def _passthrough_pcie_layout(
             managed_controllers.append(controller)
     managed_controllers.sort(key=lambda item: int(item.get("index", "0")))
 
+    # The devices below these ports are soldered/internal desktop devices, not
+    # Thunderbolt-style surprise-removable endpoints.  QEMU's root-port
+    # default advertises PCIe hot-plug capability; with Windows Kernel DMA
+    # Protection enabled that makes the passed GPU and xHCI controllers look
+    # like post-lock external DMA devices.  Keep the topology faithful to a
+    # normal motherboard and prevent DMA Guard from withholding their drivers
+    # at the lock screen.
+    for controller in managed_controllers:
+        target = controller.find("target")
+        if target is not None:
+            target.set("hotplug", "off")
+
     # Bridges created by an earlier passthrough update contain only managed
     # hostdevs (removed by update_passthrough before this helper is called).
     # Recreate them so a group changing between one and several devices never
@@ -222,7 +370,10 @@ def _passthrough_pcie_layout(
         # controller index here collides with ports that libvirt auto-adds for
         # unrelated devices (for example index 1 at 02.0 must be port 0x10,
         # while index 2 at 02.1 is port 0x11).
-        _sub(controller, "target", chassis=str(max_index), port=f"0x{slot * 8 + function:x}")
+        _sub(
+            controller, "target", chassis=str(max_index),
+            port=f"0x{slot * 8 + function:x}", hotplug="off",
+        )
         attrs = {
             "type": "pci", "domain": "0x0000", "bus": "0x00",
             "slot": f"0x{slot:02x}", "function": f"0x{function:x}",
@@ -280,11 +431,20 @@ def _passthrough_pcie_layout(
         for address in members:
             normalized = _normalized_pci_address(address)
             physical_slot, function_text = normalized.rsplit(".", 1)
+            # A lone host function such as an AMD USB controller at 0c:00.4
+            # must appear as function 0 in its own guest slot.  PCI firmware
+            # and Windows normally probe functions 1-7 only after function 0
+            # advertises a multifunction device.  Preserving .4 by itself
+            # leaves its BAR unmapped and every attached USB device inert.
+            guest_function = (
+                int(function_text)
+                if physical_slot in multifunction_slots else 0
+            )
             attrs = {
                 "type": "pci", "domain": "0x0000",
                 "bus": f"0x{endpoint_bus:02x}",
                 "slot": f"0x{slot_order[physical_slot]:02x}",
-                "function": f"0x{int(function_text):x}",
+                "function": f"0x{guest_function:x}",
             }
             if physical_slot in multifunction_slots and int(function_text) == 0:
                 attrs["multifunction"] = "on"
@@ -311,6 +471,7 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
     guest_secure_boot = bool(profile.get("guest_secure_boot", False))
     guest_dma_protection = bool(profile.get("guest_dma_protection", False))
     guest_core_isolation = bool(profile.get("guest_core_isolation", False))
+    tpm_mode, tpm_model, tpm_profile = _tpm_settings(profile)
     if guest_core_isolation and not guest_secure_boot:
         raise AppError("Core Isolation/VBS requires Guest UEFI Secure Boot.")
     gpu_pci = passthrough.get("gpu_pci")
@@ -334,6 +495,17 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
         guest_dma_protection and guest_vtd_active
     )
     guest_core_isolation_active = bool(guest_core_isolation and not install_stage)
+    guest_hyperv_enlightenments = bool(
+        guest_core_isolation_active
+        and profile.get("guest_hyperv_enlightenments", guest_core_isolation)
+    )
+    amd_hyperv_acceleration = bool(
+        guest_hyperv_enlightenments
+        and amd_nested_hyperv_acceleration_available(profile)
+    )
+    amd_hyperv_avic = bool(
+        guest_hyperv_enlightenments and amd_avic_available(profile)
+    )
     gpu_guest_pci = (
         _single_gpu_guest_functions(passthrough, host_pci)
         if gpu_passthrough_active else gpu_pci
@@ -343,6 +515,33 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
     _sub(domain, "uuid", identity["domain_uuid"])
     metadata = _sub(domain, "metadata")
     stage_metadata = _sub(metadata, f"{{{AAVM_NS}}}stage", stage)
+    stage_metadata.set("tpm-mode", tpm_mode)
+    stage_metadata.set("tpm-profile", tpm_profile or "none")
+    cpuid_policy = str(resources.get("cpuid_policy", "intercepted"))
+    if cpuid_policy not in {"intercepted", "svme-gated-native"}:
+        raise AppError(f"Unsupported CPUID policy: {cpuid_policy}")
+    if cpuid_policy == "svme-gated-native":
+        host_cpu = profile.get("host", {}).get("cpu", {})
+        vcpus = int(resources.get("vcpus", 0))
+        pins = [
+            int(cpu) for cpu in resources.get("cpu_pinning", {}).get("vcpus", [])
+        ]
+        native_apic_ids = {
+            int(cpu): int(apic_id)
+            for cpu, apic_id in host_cpu.get("native_apic_ids", {}).items()
+        }
+        if (
+            host_cpu.get("vendor") != "amd"
+            or vcpus <= 0
+            or len(pins) != vcpus
+            or len(set(pins)) != vcpus
+            or any(native_apic_ids.get(cpu) != vcpu for vcpu, cpu in enumerate(pins))
+        ):
+            raise AppError(
+                "SVME-gated native CPUID requires each guest vCPU to be uniquely "
+                "pinned to the AMD host logical CPU with the same native APIC ID."
+            )
+    stage_metadata.set("cpuid-policy", cpuid_policy)
     if physical_gpu_display:
         # libvirt preserves only one top-level element per custom metadata
         # namespace.  Store the mode on the existing stage element instead of
@@ -359,6 +558,13 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
             "guest-core-isolation",
             "true" if guest_core_isolation_active else "false",
         )
+        stage_metadata.set(
+            "guest-hyperv-enlightenments",
+            "true" if guest_hyperv_enlightenments else "false",
+        )
+        stage_metadata.set(
+            "guest-gmet", "true" if amd_hyperv_acceleration else "false",
+        )
         if guest_vtd_active:
             stage_metadata.set(
                 "guest-vtd-intremap",
@@ -366,6 +572,11 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
             )
     _sub(domain, "memory", str(resources["memory_gib"]), unit="GiB")
     _sub(domain, "currentMemory", str(resources["memory_gib"]), unit="GiB")
+    if bool(resources.get("hugepages_2m", False)):
+        memory_backing = _sub(domain, "memoryBacking")
+        hugepages = _sub(memory_backing, "hugepages")
+        _sub(hugepages, "page", size=str(HUGEPAGE_2M_KIB), unit="KiB")
+        _sub(memory_backing, "nosharepages")
     _sub(domain, "vcpu", str(resources["vcpus"]), placement="static")
     pinning = resources.get("cpu_pinning", {})
     vcpu_pins = [int(cpu) for cpu in pinning.get("vcpus", [])]
@@ -433,7 +644,11 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
             policy="require" if guest_core_isolation_active else "disable",
             name=virtualization,
         )
-    if host_cpu.get("vendor") == "amd":
+    host_x86_features = set(host_cpu.get("x86_features", []))
+    if (
+        host_cpu.get("vendor") == "amd"
+        and ("x86_features" not in host_cpu or "topoext" in host_x86_features)
+    ):
         _sub(cpu, "feature", policy="require", name="topoext")
 
     clock = _sub(domain, "clock", offset="localtime")
@@ -454,6 +669,9 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
 
     devices = _sub(domain, "devices")
     _sub(devices, "emulator", qemu_path)
+    if tpm_mode == "emulator":
+        tpm = _sub(devices, "tpm", model=tpm_model)
+        _sub(tpm, "backend", type="emulator", version="2.0", persistent_state="yes")
     disk = _sub(devices, "disk", type="file", device="disk")
     _sub(disk, "driver", name="qemu", type="qcow2", cache="none", discard="ignore")
     _sub(disk, "source", file=paths["disk"])
@@ -469,6 +687,11 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
     _sub(devices, "controller", type="sata", index="0")
     if not minimal_devices or passthrough.get("usb"):
         _sub(devices, "controller", type="usb", index="0", model="qemu-xhci")
+    else:
+        # Omitting the controller makes libvirt add its default qemu-xhci
+        # controller back when the domain is redefined.  An explicit none
+        # model keeps the controller absent at runtime and in virt-manager.
+        _sub(devices, "controller", type="usb", index="0", model="none")
     if not minimal_devices:
         _sub(devices, "input", type="mouse", bus="ps2")
         _sub(devices, "input", type="keyboard", bus="ps2")
@@ -601,6 +824,10 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
         for aml in paths.get("ssdt", []):
             _sub(commandline, f"{{{QEMU_NS}}}arg", value="-acpitable")
             _sub(commandline, f"{{{QEMU_NS}}}arg", value=f"file={aml}")
+    apply_hyperv_enlightenments(
+        domain, guest_hyperv_enlightenments, amd_hyperv_acceleration,
+        amd_hyperv_avic,
+    )
 
     if physical_gpu_display and gpu_guest_pci:
         display = _gpu_display_functions(gpu_guest_pci, host_pci)[0]
@@ -842,6 +1069,23 @@ def validate_required(xml_text: str) -> list[str]:
         "KVM hidden": root.find("./features/kvm/hidden[@state='on']"),
         "disabled balloon": root.find("./devices/memballoon[@model='none']"),
     }
+    tpm = root.find("./devices/tpm")
+    tpm_mode = stage_element.get("tpm-mode", "none") if stage_element is not None else "none"
+    tpm_profile = stage_element.get("tpm-profile", "generic") if stage_element is not None else "generic"
+    if tpm_mode == "emulator":
+        checks["persistent vTPM"] = (
+            tpm
+            if tpm is not None
+            and tpm.get("model") in TPM_MODELS
+            and tpm.find("backend[@type='emulator'][@version='2.0'][@persistent_state='yes']") is not None
+            else None
+        )
+        if tpm_profile == "amd-ftpm" and (tpm is None or tpm.get("model") != "tpm-crb"):
+            errors.append("AMD fTPM profile requires tpm-crb")
+        elif tpm_profile not in TPM_PROFILES:
+            errors.append(f"Unsupported TPM profile metadata: {tpm_profile}")
+    elif tpm_mode == "none" and tpm is not None:
+        errors.append("TPM XML exists while profile declares no TPM")
     if patched_stage:
         checks["QEMU split IOAPIC"] = root.find("./features/ioapic[@driver='qemu']")
         if stage == "gpu-setup":
@@ -940,6 +1184,47 @@ def validate_required(xml_text: str) -> list[str]:
         errors.append("Core Isolation/VBS requires Guest UEFI Secure Boot metadata")
     if not core_isolation and required_virtualization:
         errors.append("Guest SVM/VMX requires explicit Core Isolation/VBS metadata")
+    hyperv_enlightenments = bool(
+        stage_element is not None
+        and stage_element.get("guest-hyperv-enlightenments") == "true"
+    )
+    if hyperv_enlightenments:
+        for feature in HYPERV_ACCELERATED_FEATURES:
+            if root.find(f"./features/hyperv/{feature}[@state='on']") is None:
+                errors.append(
+                    f"HVCI nested Hyper-V acceleration is missing {feature}"
+                )
+        if root.find("./features/hyperv/stimer/direct[@state='on']") is None:
+            errors.append("HVCI nested Hyper-V acceleration requires direct stimer")
+        if root.find("./clock/timer[@name='hypervclock'][@present='yes']") is None:
+            errors.append("HVCI nested Hyper-V acceleration requires hypervclock")
+    gmet_enabled = bool(
+        stage_element is not None and stage_element.get("guest-gmet") == "true"
+    )
+    qemu_values = {arg.get("value", "") for arg in qemu_args}
+    if hyperv_enlightenments:
+        for value in HYPERV_NESTED_MMU_QEMU_GLOBALS:
+            if value not in qemu_values:
+                errors.append(
+                    f"HVCI nested shadow-MMU guard is missing {value}"
+                )
+    elif any(value in qemu_values for value in HYPERV_NESTED_MMU_QEMU_GLOBALS):
+        errors.append("Nested shadow-MMU globals require Hyper-V enlightenments")
+    if gmet_enabled:
+        for value in HYPERV_AMD_QEMU_GLOBALS:
+            if value not in qemu_values:
+                errors.append(f"AMD nested Hyper-V acceleration is missing {value}")
+    elif any(value in qemu_values for value in HYPERV_AMD_QEMU_GLOBALS):
+        errors.append("AMD nested Hyper-V globals require guest-gmet metadata")
+    memory_backing = root.find("./memoryBacking")
+    if memory_backing is not None:
+        hugepage = memory_backing.find(
+            f"./hugepages/page[@size='{HUGEPAGE_2M_KIB}'][@unit='KiB']"
+        )
+        if hugepage is None:
+            errors.append("Unsupported hugepage configuration: require 2 MiB pages")
+        if memory_backing.find("nosharepages") is None:
+            errors.append("Hugepage memory must disable KSM sharing")
     if install_stage and any(
         arg.get("value", "").startswith("file=")
         and "ssdt" in arg.get("value", "").lower()

@@ -1,0 +1,619 @@
+diff -urN a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
+--- a/arch/x86/kvm/svm/nested.c	2026-08-31 23:52:59.536028622 +0800
++++ b/arch/x86/kvm/svm/nested.c	2026-08-31 23:54:48.549837000 +0800
+@@ -1083,17 +1083,29 @@
+ 	return 0;
+ }
+ 
++static void nested_svm_release_vmcb12_map(struct vcpu_svm *svm)
++{
++	if (kvm_vcpu_mapped(&svm->nested.vmcb12_map))
++		kvm_vcpu_unmap(&svm->vcpu, &svm->nested.vmcb12_map);
++
++	svm->nested.vmcb12_map_generation = 0;
++}
++
+ static int nested_svm_copy_vmcb12_to_cache(struct kvm_vcpu *vcpu, u64 vmcb12_gpa)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+-	struct kvm_host_map map;
++	struct kvm_host_map *map = &svm->nested.vmcb12_map;
+ 	struct vmcb *vmcb12;
+ 	int r = 0;
+ 
+-	if (kvm_vcpu_map(vcpu, gpa_to_gfn(vmcb12_gpa), &map))
++	/* A stale map indicates an aborted/forced nested run. */
++	nested_svm_release_vmcb12_map(svm);
++	if (kvm_vcpu_map(vcpu, gpa_to_gfn(vmcb12_gpa), map))
+ 		return -EFAULT;
+ 
+-	vmcb12 = map.hva;
++	svm->nested.vmcb12_map_generation =
++		READ_ONCE(kvm_vcpu_memslots(vcpu)->generation);
++	vmcb12 = map->hva;
+ 	nested_copy_vmcb_control_to_cache(svm, &vmcb12->control);
+ 	nested_copy_vmcb_save_to_cache(svm, &vmcb12->save);
+ 
+@@ -1107,7 +1119,10 @@
+ 		r = -EINVAL;
+ 	}
+ 
+-	kvm_vcpu_unmap(vcpu, &map);
++	/* Invalid VMRUN writes SVM_EXIT_ERR immediately and has no L2 run. */
++	if (r)
++		nested_svm_release_vmcb12_map(svm);
++
+ 	return r;
+ }
+ 
+@@ -1156,8 +1171,10 @@
+ 	 * FIXME: If TF is set on VMRUN should inject a #DB (or handle guest
+ 	 * debugging) right after #VMEXIT, right now it's just ignored.
+ 	 */
+-	if (!svm_skip_emulated_instruction(vcpu))
++	if (!svm_skip_emulated_instruction(vcpu)) {
++		nested_svm_release_vmcb12_map(svm);
+ 		return 0;
++	}
+ 
+ 	if (ret)
+ 		goto insn_retired;
+@@ -1251,15 +1268,27 @@
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	struct vmcb *vmcb02 = svm->nested.vmcb02.ptr;
+-	struct kvm_host_map map;
++	struct kvm_host_map *map = &svm->nested.vmcb12_map;
+ 	struct vmcb *vmcb12;
++	u64 generation;
+ 	int rc;
+ 
+-	rc = kvm_vcpu_map(vcpu, gpa_to_gfn(svm->nested.vmcb12_gpa), &map);
+-	if (rc)
+-		return rc;
++	generation = READ_ONCE(kvm_vcpu_memslots(vcpu)->generation);
++	if (!kvm_vcpu_mapped(map) ||
++	    map->gfn != gpa_to_gfn(svm->nested.vmcb12_gpa) ||
++	    svm->nested.vmcb12_map_generation != generation ||
++	    (generation & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS)) {
++		nested_svm_release_vmcb12_map(svm);
++
++		rc = kvm_vcpu_map(vcpu, gpa_to_gfn(svm->nested.vmcb12_gpa), map);
++		if (rc)
++			return rc;
++
++		svm->nested.vmcb12_map_generation =
++			READ_ONCE(kvm_vcpu_memslots(vcpu)->generation);
++	}
+ 
+-	vmcb12 = map.hva;
++	vmcb12 = map->hva;
+ 
+ 	vmcb12->save.es     = vmcb02->save.es;
+ 	vmcb12->save.cs     = vmcb02->save.cs;
+@@ -1314,7 +1343,7 @@
+ 				       vmcb12->control.exit_int_info_err,
+ 				       KVM_ISA_SVM);
+ 
+-	kvm_vcpu_unmap(vcpu, &map);
++	nested_svm_release_vmcb12_map(svm);
+ 	return 0;
+ }
+ 
+@@ -1511,6 +1540,8 @@
+ 	if (!svm->nested.initialized)
+ 		return;
+ 
++	nested_svm_release_vmcb12_map(svm);
++
+ 	if (WARN_ON_ONCE(svm->vmcb != svm->vmcb01.ptr))
+ 		svm_switch_vmcb(svm, &svm->vmcb01);
+ 
+@@ -1536,6 +1567,8 @@
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 
++	nested_svm_release_vmcb12_map(svm);
++
+ 	if (is_guest_mode(vcpu)) {
+ 		vcpu->arch.nested_run_pending = 0;
+ 		svm->nested.vmcb12_gpa = INVALID_GPA;
+@@ -1803,6 +1836,17 @@
+ 	struct kvm_vcpu *vcpu = &svm->vcpu;
+ 
+ 	switch (exit_code) {
++	case SVM_EXIT_CPUID:
++		/*
++		 * KVM-AAVM: consume CPUID leaf 0 in L0 for every L2.  The
++		 * architectural result comes from KVM's cached CPUID table and
++		 * avoids the extra L0 -> L1 -> L0 nested-exit round trip.  Do not
++		 * gate this on L2 hypercall state: that state is false for the
++		 * Hyper-V root partition.  Every other leaf retains L1 ownership.
++		 */
++		if (kvm_rax_read(vcpu) == 0)
++			return NESTED_EXIT_HOST;
++		break;
+ 	case SVM_EXIT_INTR:
+ 	case SVM_EXIT_NMI:
+ 	case SVM_EXIT_NPF:
+@@ -1811,9 +1855,41 @@
+ 		u32 excp_bits = 1 << (exit_code - SVM_EXIT_EXCP_BASE);
+ 
+ 		if (svm->vmcb01.ptr->control.intercepts[INTERCEPT_EXCEPTION] &
+-		    excp_bits)
++		    excp_bits) {
++			/*
++			 * KVM-AAVM: SVM keeps #DB intercepted in VMCB01 to support
++			 * host debugging and NMI single-step.  With neither feature
++			 * active, and with VMCB12 explicitly owning #DB, the normal
++			 * path needlessly queues the exception and waits for the next
++			 * generic event pass before reflecting it to L1.  Synchronize
++			 * DR6 exactly as that path does and inject the nested VM-Exit
++			 * in this pass.  All ambiguous states retain the stock path.
++			 */
++			if (exit_code == SVM_EXIT_EXCP_BASE + DB_VECTOR &&
++			    vmcb12_is_intercept(&svm->nested.ctl, exit_code) &&
++			    !(vcpu->guest_debug &
++			      (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP)) &&
++			    !svm->nmi_singlestep &&
++			    !kvm_is_exception_pending(vcpu) &&
++			    !kvm_event_needs_reinjection(vcpu)) {
++				struct kvm_queued_exception db = {
++					.vector = DB_VECTOR,
++					.has_payload = true,
++					.payload = svm->vmcb->save.dr6 ^
++						   DR6_ACTIVE_LOW,
++				};
++
++				kvm_deliver_exception_payload(vcpu, &db);
++				if (vcpu->arch.dr7 & DR7_GD) {
++					vcpu->arch.dr7 &= ~DR7_GD;
++					kvm_update_dr7(vcpu);
++				}
++				nested_svm_vmexit(svm);
++				return NESTED_EXIT_DONE;
++			}
++
+ 			return NESTED_EXIT_HOST;
+-		else if (exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR &&
++		} else if (exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR &&
+ 			 svm->vcpu.arch.apf.host_apf_flags)
+ 			/* Trap async PF even if not shadowing */
+ 			return NESTED_EXIT_HOST;
+diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+--- a/arch/x86/kvm/svm/svm.c	2026-08-31 23:52:59.536849778 +0800
++++ b/arch/x86/kvm/svm/svm.c	2026-08-31 23:54:48.574835996 +0800
+@@ -238,8 +238,8 @@
+ 
+ 			svm_leave_nested(vcpu);
+ 			/* #GP intercept is still needed for vmware backdoor */
+-			if (!enable_vmware_backdoor)
+-				clr_exception_intercept(svm, GP_VECTOR);
++//			if (!enable_vmware_backdoor)  // NIKA removed
++//				clr_exception_intercept(svm, GP_VECTOR);  // NIKA removed
+ 
+ 			/*
+ 			 * Free the nested guest state, unless we are in SMM.
+@@ -837,10 +837,10 @@
+ 	svm_set_intercept_for_msr(vcpu, MSR_IA32_SYSENTER_ESP, MSR_TYPE_RW,
+ 				  guest_cpuid_is_intel_compatible(vcpu));
+ 
+-	if (kvm_aperfmperf_in_guest(vcpu->kvm)) {
++//	if (kvm_aperfmperf_in_guest(vcpu->kvm)) {  // NIKA removed
+ 		svm_disable_intercept_for_msr(vcpu, MSR_IA32_APERF, MSR_TYPE_R);
+ 		svm_disable_intercept_for_msr(vcpu, MSR_IA32_MPERF, MSR_TYPE_R);
+-	}
++//	}  // NIKA removed
+ 
+ 	if (kvm_cpu_cap_has(X86_FEATURE_SHSTK)) {
+ 		bool shstk_enabled = guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK);
+@@ -1044,6 +1044,10 @@
+ static void svm_recalc_instruction_intercepts(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++	bool svme = vcpu->arch.efer & EFER_SVME;
++
++	if (is_guest_mode(vcpu))
++		svme = svm->vmcb01.ptr->save.efer & EFER_SVME;
+ 
+ 	/*
+ 	 * Intercept INVPCID if shadow paging is enabled to sync/free shadow
+@@ -1111,6 +1115,17 @@
+ 		}
+ 	}
+ 
++	/*
++	 * KVM-AAVM: keep firmware and the ordinary Windows kernel on KVM's
++	 * architectural CPUID model.  Once an outer Hyper-V enables EFER.SVME,
++	 * let only VMCB01 execute native CPUID.  VMCB12/02 intercept ownership
++	 * remains merged by the normal nested intercept recalculation path.
++	 */
++	if (svme)
++		svm_clr_intercept(svm, INTERCEPT_CPUID);
++	else
++		svm_set_intercept(svm, INTERCEPT_CPUID);
++
+ 	if (kvm_need_rdpmc_intercept(vcpu))
+ 		svm_set_intercept(svm, INTERCEPT_RDPMC);
+ 	else
+@@ -1141,7 +1156,8 @@
+ 	set_dr_intercepts(svm);
+ 
+ 	set_exception_intercept(svm, PF_VECTOR);
+-	set_exception_intercept(svm, UD_VECTOR);
++//	set_exception_intercept(svm, UD_VECTOR);  // NIKA removed
++	clr_exception_intercept(svm, UD_VECTOR);  // NIKA added
+ 	set_exception_intercept(svm, MC_VECTOR);
+ 	set_exception_intercept(svm, AC_VECTOR);
+ 	set_exception_intercept(svm, DB_VECTOR);
+@@ -1151,7 +1167,7 @@
+ 	 * We intercept those #GP and allow access to them anyway
+ 	 * as VMware does.
+ 	 */
+-	if (enable_vmware_backdoor)
++//	if (enable_vmware_backdoor)  // NIKA removed
+ 		set_exception_intercept(svm, GP_VECTOR);
+ 
+ 	svm_set_intercept(svm, INTERCEPT_INTR);
+@@ -1161,8 +1177,12 @@
+ 		svm_set_intercept(svm, INTERCEPT_SMI);
+ 
+ 	svm_set_intercept(svm, INTERCEPT_SELECTIVE_CR0);
+-	svm_set_intercept(svm, INTERCEPT_RDPMC);
+-	svm_set_intercept(svm, INTERCEPT_CPUID);
++	if (vcpu->arch.efer & EFER_SVME)
++		svm_clr_intercept(svm, INTERCEPT_CPUID);
++	else
++		svm_set_intercept(svm, INTERCEPT_CPUID);
++//	svm_set_intercept(svm, INTERCEPT_RDPMC);  // NIKA removed
++	svm_clr_intercept(svm, INTERCEPT_RDPMC);  // NIKA added
+ 	svm_set_intercept(svm, INTERCEPT_INVD);
+ 	svm_set_intercept(svm, INTERCEPT_INVLPG);
+ 	svm_set_intercept(svm, INTERCEPT_INVLPGA);
+@@ -1181,6 +1201,8 @@
+ 	svm_set_intercept(svm, INTERCEPT_XSETBV);
+ 	svm_set_intercept(svm, INTERCEPT_RDPRU);
+ 	svm_set_intercept(svm, INTERCEPT_RSM);
++	svm_clr_intercept(svm, INTERCEPT_RDTSC);  // NIKA added
++	svm_clr_intercept(svm, INTERCEPT_RDTSCP);  // NIKA added
+ 
+ 	if (!kvm_mwait_in_guest(vcpu->kvm)) {
+ 		svm_set_intercept(svm, INTERCEPT_MONITOR);
+@@ -2317,6 +2339,7 @@
+ 	/* Both #GP cases have zero error_code */
+ 	if (error_code)
+ 		goto reinject;
++	else if (svm_get_cpl(vcpu) == 3) { kvm_queue_exception(vcpu, UD_VECTOR); return 1; }  // NIKA added
+ 
+ 	/* Decode the instruction for usage later */
+ 	if (x86_decode_emulated_instruction(vcpu, 0, NULL, 0) != EMULATION_OK)
+@@ -3160,10 +3183,10 @@
+ 		 * Suppress BTF as KVM doesn't virtualize BTF, but there's no
+ 		 * way to communicate lack of support to the guest.
+ 		 */
+-		if (data & DEBUGCTLMSR_BTF) {
+-			kvm_pr_unimpl_wrmsr(vcpu, MSR_IA32_DEBUGCTLMSR, data);
+-			data &= ~DEBUGCTLMSR_BTF;
+-		}
++//		if (data & DEBUGCTLMSR_BTF) {  // NIKA removed
++//			kvm_pr_unimpl_wrmsr(vcpu, MSR_IA32_DEBUGCTLMSR, data);  // NIKA removed
++//			data &= ~DEBUGCTLMSR_BTF;  // NIKA removed
++//		}  // NIKA removed
+ 
+ 		if (data & DEBUGCTL_RESERVED_BITS)
+ 			return 1;
+@@ -3384,7 +3407,8 @@
+ 	[SVM_EXIT_TASK_SWITCH]			= task_switch_interception,
+ 	[SVM_EXIT_SHUTDOWN]			= shutdown_interception,
+ 	[SVM_EXIT_VMRUN]			= vmrun_interception,
+-	[SVM_EXIT_VMMCALL]			= vmmcall_interception,
++//	[SVM_EXIT_VMMCALL]			= vmmcall_interception,  // KVM-AAVM: do not expose VMMCALL interception
++	[SVM_EXIT_VMMCALL]			= kvm_handle_invalid_op,
+ 	[SVM_EXIT_VMLOAD]			= vmload_interception,
+ 	[SVM_EXIT_VMSAVE]			= vmsave_interception,
+ 	[SVM_EXIT_STGI]				= stgi_interception,
+@@ -4417,6 +4441,45 @@
+ 	return 1;
+ }
+ 
++static fastpath_t handle_fastpath_nested_cpuid0(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++	struct vmcb_control_area *control = &svm->vmcb->control;
++
++	/*
++	 * Keep architectural corner cases on the normal handler.  In
++	 * particular, the slow path must inject #GP when CPUID faulting is
++	 * enabled, and must account for instructions in a mediated PMU.
++	 */
++	if (!svm->cpuid0.valid ||
++	    !kvm_pmu_is_fastpath_emulation_allowed(vcpu) ||
++	    !kvm_is_cpuid_allowed(vcpu) ||
++	    (svm->vmcb->save.rflags & X86_EFLAGS_TF) ||
++	    (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP))
++		return EXIT_FASTPATH_NONE;
++
++	trace_kvm_nested_vmexit(vcpu, KVM_ISA_SVM);
++	trace_kvm_cpuid(0, kvm_ecx_read(vcpu), svm->cpuid0.eax, svm->cpuid0.ebx,
++			svm->cpuid0.ecx, svm->cpuid0.edx, true, false);
++
++	kvm_eax_write(vcpu, svm->cpuid0.eax);
++	kvm_ebx_write(vcpu, svm->cpuid0.ebx);
++	kvm_ecx_write(vcpu, svm->cpuid0.ecx);
++	kvm_edx_write(vcpu, svm->cpuid0.edx);
++
++	/*
++	 * The PMU guard above proves that no active mediated counter needs a
++	 * software instruction-retired event.  TF and KVM single-step are also
++	 * excluded, so reproduce SVM's NRIPS skip directly and avoid the generic
++	 * static-call/PMU/debug tail on this timing-sensitive leaf.
++	 */
++	svm->next_rip = control->next_rip;
++	kvm_rip_write(vcpu, control->next_rip);
++	control->int_state &= ~SVM_INTERRUPT_SHADOW_MASK;
++
++	return EXIT_FASTPATH_REENTER_GUEST;
++}
++
+ static fastpath_t svm_exit_handlers_fastpath(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+@@ -4429,8 +4492,19 @@
+ 	if (!nrips || !control->next_rip)
+ 		return EXIT_FASTPATH_NONE;
+ 
+-	if (is_guest_mode(vcpu))
++	if (is_guest_mode(vcpu)) {
++		/*
++		 * KVM-AAVM: VMCB12 retains CPUID intercept ownership.  Only leaf 0
++		 * is consumed by L0, using cached KVM CPUID data and immediate
++		 * VM-Entry to avoid the full nested VM-Exit software path.
++		 */
++		if (!is_sev_es_guest(vcpu) &&
++		    control->exit_code == SVM_EXIT_CPUID &&
++		    kvm_rax_read(vcpu) == 0)
++			return handle_fastpath_nested_cpuid0(vcpu);
++
+ 		return EXIT_FASTPATH_NONE;
++	}
+ 
+ 	switch (control->exit_code) {
+ 	case SVM_EXIT_MSR:
+@@ -4480,10 +4554,54 @@
+ 	guest_state_exit_irqoff();
+ }
+ 
++static __always_inline bool svm_vcpu_exit_request(struct kvm_vcpu *vcpu)
++{
++	/* Match the generic x86 fast-reentry request check. */
++	xfer_to_guest_mode_prepare();
++
++	return READ_ONCE(vcpu->mode) == EXITING_GUEST_MODE ||
++	       kvm_request_pending(vcpu) || xfer_to_guest_mode_work_pending();
++}
++
++static __always_inline bool
++svm_can_defer_nested_cpuid0_exit_tail(struct kvm_vcpu *vcpu, u64 run_flags)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++	struct vmcb_control_area *control = &svm->vmcb->control;
++
++	/*
++	 * A physical CPUID intercept is unavoidable while VMCB12 owns the
++	 * global CPUID intercept.  For a completely quiescent leaf-0 exit,
++	 * defer state that cannot have changed until the first non-leaf-0 exit.
++	 * Every event/debug/PMU corner case must take the full architectural
++	 * exit tail below.
++	 */
++	return !run_flags && is_guest_mode(vcpu) && !is_sev_es_guest(vcpu) &&
++	       control->exit_code == SVM_EXIT_CPUID &&
++	       svm->vmcb->save.rax == 0 && nrips && control->next_rip &&
++	       svm->cpuid0.valid && kvm_pmu_is_fastpath_emulation_allowed(vcpu) &&
++	       kvm_is_cpuid_allowed(vcpu) &&
++	       !(svm->vmcb->save.rflags & X86_EFLAGS_TF) &&
++	       !(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) &&
++	       !(control->exit_int_info & SVM_EXITINTINFO_VALID) &&
++	       !(control->event_inj & SVM_EVTINJ_VALID) &&
++	       !svm->nmi_l1_to_l2 && !svm->soft_int_injected &&
++	       !svm->awaiting_iret_completion && !svm->nmi_singlestep &&
++	       !kvm_event_needs_reinjection(vcpu) &&
++	       !kvm_is_exception_pending(vcpu) &&
++	       !vcpu->arch.nested_run_pending &&
++	       nested_svm_virtualize_tpr(vcpu) &&
++	       control->tlb_ctl == TLB_CONTROL_DO_NOTHING &&
++	       (!cpu_feature_enabled(X86_FEATURE_ERAPS) ||
++		!(control->erap_ctl & ERAP_CONTROL_CLEAR_RAP)) &&
++	       msr_write_intercepted(svm, MSR_AMD64_PERF_CNTR_GLOBAL_CTL);
++}
++
+ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+ {
+ 	bool force_immediate_exit = run_flags & KVM_RUN_FORCE_IMMEDIATE_EXIT;
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++	fastpath_t exit_fastpath;
+ 	unsigned enter_flags = 0;
+ 
+ 	if (!msr_write_intercepted(svm, MSR_IA32_SPEC_CTRL))
+@@ -4547,6 +4665,7 @@
+ 	else if (likely(!(vcpu->arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT)))
+ 		svm_set_dr6(vcpu, DR6_ACTIVE_LOW);
+ 
++aavm_nested_cpuid0_reenter:
+ 	clgi();
+ 
+ 	/*
+@@ -4603,6 +4722,32 @@
+ 	if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
+ 		kvm_after_interrupt(vcpu);
+ 
++	/*
++	 * KVM-AAVM: all hardware-written register state has been synchronized
++	 * above.  A quiescent leaf-0 exit can now defer only nested/event tail
++	 * state that remains authoritative in the active VMCB until a non-fast
++	 * exit.
++	 */
++	if (likely(svm_can_defer_nested_cpuid0_exit_tail(vcpu, run_flags)) &&
++	    likely(!svm_vcpu_exit_request(vcpu))) {
++		trace_kvm_exit(vcpu, KVM_ISA_SVM);
++		exit_fastpath = handle_fastpath_nested_cpuid0(vcpu);
++		if (WARN_ON_ONCE(exit_fastpath != EXIT_FASTPATH_REENTER_GUEST))
++			goto aavm_nested_cpuid0_finish_full_tail;
++
++		kvm_clear_available_registers(vcpu, SVM_REGS_LAZY_LOAD_SET);
++		vmcb_mark_all_clean(svm->vmcb);
++		svm->nested.ctl.next_rip = svm->vmcb->control.next_rip;
++
++		++vcpu->stat.exits;
++		trace_kvm_entry(vcpu, false);
++		svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
++		svm->vmcb->save.rsp = vcpu->arch.regs[VCPU_REGS_RSP];
++		svm->vmcb->save.rip = vcpu->arch.rip;
++		goto aavm_nested_cpuid0_reenter;
++	}
++
++aavm_nested_cpuid0_finish_full_tail:
+ 	sync_cr8_to_lapic(vcpu);
+ 
+ 	svm->next_rip = 0;
+@@ -4652,7 +4797,29 @@
+ 	if (is_guest_mode(vcpu))
+ 		svm->nested.ctl.next_rip = svm->vmcb->control.next_rip;
+ 
+-	return svm_exit_handlers_fastpath(vcpu);
++	exit_fastpath = svm_exit_handlers_fastpath(vcpu);
++	if (exit_fastpath != EXIT_FASTPATH_REENTER_GUEST || run_flags ||
++	    !is_guest_mode(vcpu) ||
++	    svm->vmcb->control.exit_code != SVM_EXIT_CPUID)
++		return exit_fastpath;
++
++	/*
++	 * KVM-AAVM: the generic x86 loop would immediately call back into this
++	 * function after checking requests (SVM has no ->sync_pir_to_irr hook).
++	 * For the already-validated nested leaf-0 fastpath, keep that request
++	 * boundary but skip invariant SVM entry preparation.  If the stricter
++	 * deferred-tail path above cannot run, this path still completes the
++	 * full VM-Exit tail before re-entry.
++	 */
++	if (unlikely(svm_vcpu_exit_request(vcpu)))
++		return exit_fastpath;
++
++	++vcpu->stat.exits;
++	trace_kvm_entry(vcpu, false);
++	svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
++	svm->vmcb->save.rsp = vcpu->arch.regs[VCPU_REGS_RSP];
++	svm->vmcb->save.rip = vcpu->arch.rip;
++	goto aavm_nested_cpuid0_reenter;
+ }
+ 
+ static void svm_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa,
+@@ -4731,6 +4898,21 @@
+ static void svm_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++	struct kvm_cpuid_entry2 *entry;
++
++	/*
++	 * Cache immutable leaf 0 while IRQs are enabled.  CPUID table lookups
++	 * are intentionally forbidden in the IRQ-off VM-Exit fastpath.
++	 */
++	svm->cpuid0.valid = false;
++	entry = kvm_find_cpuid_entry(vcpu, 0);
++	if (entry) {
++		svm->cpuid0.eax = entry->eax;
++		svm->cpuid0.ebx = entry->ebx;
++		svm->cpuid0.ecx = entry->ecx;
++		svm->cpuid0.edx = entry->edx;
++		svm->cpuid0.valid = true;
++	}
+ 
+ 	/*
+ 	 * SVM doesn't provide a way to disable just XSAVES in the guest, KVM
+diff -urN a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+--- a/arch/x86/kvm/svm/svm.h	2026-08-31 23:52:59.537557601 +0800
++++ b/arch/x86/kvm/svm/svm.h	2026-08-31 23:54:48.600834951 +0800
+@@ -217,6 +217,13 @@
+ 	u64 vmcb12_gpa;
+ 	u64 last_vmcb12_gpa;
+ 	u64 last_bus_lock_rip;
++	/*
++	 * KVM-AAVM: retain the writable VMCB12 mapping for exactly one nested
++	 * run.  This removes the second pin/map on nested VM-Exit while keeping
++	 * memslot changes observable before VMCB12 is written back.
++	 */
++	struct kvm_host_map vmcb12_map;
++	u64 vmcb12_map_generation;
+ 
+ 	/*
+ 	 * The MSR permissions map used for vmcb02, which is the merge result
+@@ -287,6 +294,18 @@
+ 	u32 sysenter_esp_hi;
+ 	u32 sysenter_eip_hi;
+ 	uint64_t tsc_aux;
++	/*
++	 * KVM-AAVM: CPUID leaf 0 is immutable after KVM_SET_CPUID2.  Cache it
++	 * so nested SVM can emulate the timing-sensitive leaf in the IRQ-off
++	 * VM-Exit fastpath without scanning the vCPU's CPUID table.
++	 */
++	struct {
++		u32 eax;
++		u32 ebx;
++		u32 ecx;
++		u32 edx;
++		bool valid;
++	} cpuid0;
+ 
+ 	u64 msr_decfg;
+ 
+@@ -784,7 +803,8 @@
+ BUILD_SVM_MSR_BITMAP_HELPERS(void, clear, __clear)
+ BUILD_SVM_MSR_BITMAP_HELPERS(void, set, __set)
+ 
+-#define DEBUGCTL_RESERVED_BITS (~DEBUGCTLMSR_LBR)
++//#define DEBUGCTL_RESERVED_BITS (~DEBUGCTLMSR_LBR)  // NIKA removed
++#define DEBUGCTL_RESERVED_BITS (~(DEBUGCTLMSR_LBR | DEBUGCTLMSR_BTF))  /* NIKA added */
+ 
+ /* svm.c */
+ extern bool dump_invalid_vmcb;
+diff -urN a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+--- a/arch/x86/kvm/x86.c	2026-08-31 23:52:59.538391320 +0800
++++ b/arch/x86/kvm/x86.c	2026-08-31 23:52:59.543028369 +0800
+@@ -543,6 +543,9 @@
+ 		return 0;
+ 
+ 	if (!ignore_msrs) {
++		if (report_ignored_msrs)  // NIKA added
++			/* sudo sysctl -w kernel.printk_ratelimit_burst=1000 */
++			/* sudo dmesg [-l debug] */
+ 		kvm_debug_ratelimited("unhandled %s: 0x%x data 0x%llx\n",
+ 				      op, msr, *data);
+ 		return ret;
+@@ -14476,6 +14479,7 @@
+ 
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_entry);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_exit);
++EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_cpuid);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_mmio);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_fast_mmio);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_inj_virq);
+diff -urN a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+--- a/include/linux/kvm_host.h	2026-08-31 23:52:59.540581977 +0800
++++ b/include/linux/kvm_host.h	2026-08-31 23:52:59.543413020 +0800
+@@ -882,11 +882,15 @@
+ 	pr_err("kvm [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)
+ #define kvm_info(fmt, ...) \
+ 	pr_info("kvm [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)
++/*#define kvm_debug(fmt, ...) \  */
++/*	pr_debug("kvm [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)  */
+ #define kvm_debug(fmt, ...) \
+-	pr_debug("kvm [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)
++	pr_err("dbg [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)
++/*#define kvm_debug_ratelimited(fmt, ...) \  */
++/*	pr_debug_ratelimited("kvm [%i]: " fmt, task_pid_nr(current), \  */
++/*			     ## __VA_ARGS__)  */
+ #define kvm_debug_ratelimited(fmt, ...) \
+-	pr_debug_ratelimited("kvm [%i]: " fmt, task_pid_nr(current), \
+-			     ## __VA_ARGS__)
++	pr_err("dbg_rl [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)
+ #define kvm_pr_unimpl(fmt, ...) \
+ 	pr_err_ratelimited("kvm [%i]: " fmt, \
+ 			   task_tgid_nr(current), ## __VA_ARGS__)
