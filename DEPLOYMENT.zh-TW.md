@@ -398,15 +398,18 @@ Linux 7.2 已包含 KVM AMD GMET 與 nested-SVM 支援。部署器在每次套�
 Intel 主機仍可使用標準 nested Hyper-V enlightenment。這些選項降低巢狀 Hyper-V/HVCI
 的正確性與效能成本，並不會偽造計時結果或保證移除 `timing anomaly` 偵測。
 
-Linux 7.2 AMD 測試核心僅在 Windows/Hyper-V 寫入 `EFER.SVME` 後清除 VMCB01 的
-`INTERCEPT_CPUID`；韌體、一般 Windows 開機，以及隱藏 guest SVM/VMX 的 VM 都維持
-KVM CPUID 模型。隱藏 SVM 不能作為原生 CPUID 的條件，否則客體會讀到主機的拓撲和未宣告
-功能。Nested VMCB02 保留 L0/L1 的 intercept 合併，不能依 VMRUN 時快照的 CPL 清除
-CPUID，否則會繞過 L1 並可能讓 Windows Hyper-V 停滯。先前
+Linux 7.2 AMD 測試核心在每個 non-SEV vCPU reset 後，先以 30 秒 jiffies grace 維持
+VMCB01 的 KVM CPUID 模型，讓韌體與 Windows 早期開機使用架構化的 guest-visible 結果；grace
+結束後會黏著清除 VMCB01 的 `INTERCEPT_CPUID`。Windows/Hyper-V 成功寫入 `EFER.SVME`
+也會提早 arm；即使 Hyper-V 暫時清除 SVME，也不會在 recalc/init_vmcb 時重新打開 intercept。
+vCPU reset 會清除 arm 並重新計時。隱藏 SVM 不能作為原生 CPUID 的條件，否則客體會在早期
+開機讀到主機的拓撲和未宣告功能。Nested VMCB02 保留上游的 L0/L1 intercept 合併，不能直接
+清除 CPUID：VMCB01 已透傳且 VMCB12 未要求 CPUID exit 時，合併的 VMCB02 會自然透傳；只要
+L1 要求 ownership，結果仍保留 CPUID exit。這避免繞過 L1 並重現 Windows Hyper-V 停滯。先前
 `resources.cpuid_policy=svme-gated-native` 的舊 profile 在下一次套用去虛擬化設定時會
 遷移為 `intercepted`；XML 產生期間也會以 intercepted 相容處理。修改需重新建置、安裝並
 開機進入 Linux 7.2.2 patched AMD 核心後才會生效；是否消除 VMAware 計時異常必須以重新
-量測結果為準。
+量測結果為準，正式 TIMER 量測必須在 reset/開機至少 30 秒後、且 profiler 已停止時執行。
 
 為了降低仍無法避免的 nested leaf 0 VMEXIT 軟體成本，7.2 實驗補丁會在
 `KVM_SET_CPUID2` 後預先快取 guest-visible leaf 0，並在 SVM IRQ-off VMEXIT 路徑直接寫回
@@ -441,7 +444,7 @@ sudo python3 verification/verify_live_cpuid_policy.py
 ```
 
 此檢查會驗證執行中的 `7.2.2-tkg-eevdf`、source tree release、`kvm_amd` vermagic、
-loaded module 與 7.2 build tree module 的 GNU build ID、SVM/EFER CPUID gate、只限 leaf 0 的 L2→L0 fallback、
+loaded module 與 7.2 build tree module 的 GNU build ID、30 秒 reset grace/SVME VMCB01 CPUID handoff、只限 leaf 0 的 L2→L0 fallback、
 AMD guest leaf 7 EDX 的 Intel mitigation mask、IRQ-off fastpath 與 event-safe deferred-tail guards、VMCB02 未被直接清除，以及 `win11`
 的狀態；也會要求 `nested_npf_value_cache=absent` 與
 `vmcb12_map_reuse=present`。`srcversion` 不能單獨證明補丁已載入，因為只修改模組

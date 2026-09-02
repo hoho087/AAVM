@@ -1,6 +1,23 @@
-diff -urN a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
---- a/arch/x86/kvm/svm/nested.c	2026-08-31 23:52:59.536028622 +0800
-+++ b/arch/x86/kvm/svm/nested.c	2026-08-31 23:54:48.549837000 +0800
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -2151,6 +2151,15 @@
+ 			}
+ 		}
+ 	}
++	/*
++	 * AMD/Hygon reserve the Intel mitigation bits in CPUID.7.0.EDX.
++	 * KVM's host capability aliases may otherwise leak SPEC_CTRL, STIBP,
++	 * and SSBD into an AMD-compatible guest, which is both architecturally
++	 * wrong and visible to timing/signature detectors.  Keep AMD's native
++	 * mitigation enumeration in 0x80000008.EBX unchanged.
++	 */
++	if (function == 7 && index == 0 && vcpu->arch.is_amd_compatible)
++		*edx &= ~(BIT(26) | BIT(27) | BIT(31));
+ 	trace_kvm_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
+ 			used_max_basic);
+ 	return exact;
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
 @@ -1083,17 +1083,29 @@
  	return 0;
  }
@@ -118,7 +135,7 @@ diff -urN a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
  	if (is_guest_mode(vcpu)) {
  		vcpu->arch.nested_run_pending = 0;
  		svm->nested.vmcb12_gpa = INVALID_GPA;
-@@ -1803,6 +1836,17 @@
+@@ -1803,6 +1836,20 @@
  	struct kvm_vcpu *vcpu = &svm->vcpu;
  
  	switch (exit_code) {
@@ -129,6 +146,9 @@ diff -urN a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
 +		 * avoids the extra L0 -> L1 -> L0 nested-exit round trip.  Do not
 +		 * gate this on L2 hypercall state: that state is false for the
 +		 * Hyper-V root partition.  Every other leaf retains L1 ownership.
++		 * KVM-AAVM: CPUID remains governed by the architectural L0/L1 merge.
++		 * VMCB01 and VMCB12 both leave the global bit clear: execute natively.
++		 * Do not add a direct VMCB02 clear here; that bypasses L1 ownership.
 +		 */
 +		if (kvm_rax_read(vcpu) == 0)
 +			return NESTED_EXIT_HOST;
@@ -180,10 +200,27 @@ diff -urN a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
  			 svm->vcpu.arch.apf.host_apf_flags)
  			/* Trap async PF even if not shadowing */
  			return NESTED_EXIT_HOST;
-diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
---- a/arch/x86/kvm/svm/svm.c	2026-08-31 23:52:59.536849778 +0800
-+++ b/arch/x86/kvm/svm/svm.c	2026-08-31 23:54:48.574835996 +0800
-@@ -238,8 +238,8 @@
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -12,6 +12,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/kernel.h>
++#include <linux/jiffies.h>
+ #include <linux/vmalloc.h>
+ #include <linux/highmem.h>
+ #include <linux/amd-iommu.h>
+@@ -73,6 +74,9 @@
+ #define SEG_TYPE_LDT 2
+ #define SEG_TYPE_BUSY_TSS16 3
+ 
++/* Leave firmware and early guest bring-up on KVM's virtual CPUID model. */
++#define KVM_AAVM_CPUID_NATIVE_GRACE_MS	30000
++
+ static bool erratum_383_found __read_mostly;
+ 
+ /*
+@@ -238,8 +242,8 @@
  
  			svm_leave_nested(vcpu);
  			/* #GP intercept is still needed for vmware backdoor */
@@ -194,7 +231,16 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  
  			/*
  			 * Free the nested guest state, unless we are in SMM.
-@@ -837,10 +837,10 @@
+@@ -256,6 +260,8 @@
+ 				vcpu->arch.efer = old_efer;
+ 				return ret;
+ 			}
++			if (!is_sev_guest(vcpu))
++				svm->cpuid_native_armed = true;
+ 
+ 			/*
+ 			 * Never intercept #GP for SEV guests, KVM can't
+@@ -837,10 +843,10 @@
  	svm_set_intercept_for_msr(vcpu, MSR_IA32_SYSENTER_ESP, MSR_TYPE_RW,
  				  guest_cpuid_is_intel_compatible(vcpu));
  
@@ -207,7 +253,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  
  	if (kvm_cpu_cap_has(X86_FEATURE_SHSTK)) {
  		bool shstk_enabled = guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK);
-@@ -1044,6 +1044,10 @@
+@@ -1044,6 +1050,10 @@
  static void svm_recalc_instruction_intercepts(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_svm *svm = to_svm(vcpu);
@@ -218,17 +264,18 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  
  	/*
  	 * Intercept INVPCID if shadow paging is enabled to sync/free shadow
-@@ -1111,6 +1115,17 @@
+@@ -1111,6 +1121,18 @@
  		}
  	}
  
 +	/*
-+	 * KVM-AAVM: keep firmware and the ordinary Windows kernel on KVM's
-+	 * architectural CPUID model.  Once an outer Hyper-V enables EFER.SVME,
-+	 * let only VMCB01 execute native CPUID.  VMCB12/02 intercept ownership
-+	 * remains merged by the normal nested intercept recalculation path.
++	 * KVM-AAVM: VMCB01 is the only CPUID policy owner.  Firmware starts
++	 * intercepted; native passthrough is armed either after the reset grace
++	 * period or when L1 has successfully enabled SVM.  While L2 is active,
++	 * svm_{set,clr}_intercept() updates VMCB01 and the normal nested merge
++	 * preserves any CPUID exit requested by VMCB12.
 +	 */
-+	if (svme)
++	if (svme || svm->cpuid_native_armed)
 +		svm_clr_intercept(svm, INTERCEPT_CPUID);
 +	else
 +		svm_set_intercept(svm, INTERCEPT_CPUID);
@@ -236,7 +283,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  	if (kvm_need_rdpmc_intercept(vcpu))
  		svm_set_intercept(svm, INTERCEPT_RDPMC);
  	else
-@@ -1141,7 +1156,8 @@
+@@ -1141,7 +1163,8 @@
  	set_dr_intercepts(svm);
  
  	set_exception_intercept(svm, PF_VECTOR);
@@ -246,7 +293,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  	set_exception_intercept(svm, MC_VECTOR);
  	set_exception_intercept(svm, AC_VECTOR);
  	set_exception_intercept(svm, DB_VECTOR);
-@@ -1151,7 +1167,7 @@
+@@ -1151,7 +1174,7 @@
  	 * We intercept those #GP and allow access to them anyway
  	 * as VMware does.
  	 */
@@ -255,13 +302,13 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  		set_exception_intercept(svm, GP_VECTOR);
  
  	svm_set_intercept(svm, INTERCEPT_INTR);
-@@ -1161,8 +1177,12 @@
+@@ -1161,8 +1184,12 @@
  		svm_set_intercept(svm, INTERCEPT_SMI);
  
  	svm_set_intercept(svm, INTERCEPT_SELECTIVE_CR0);
 -	svm_set_intercept(svm, INTERCEPT_RDPMC);
 -	svm_set_intercept(svm, INTERCEPT_CPUID);
-+	if (vcpu->arch.efer & EFER_SVME)
++	if ((vcpu->arch.efer & EFER_SVME) || svm->cpuid_native_armed)
 +		svm_clr_intercept(svm, INTERCEPT_CPUID);
 +	else
 +		svm_set_intercept(svm, INTERCEPT_CPUID);
@@ -270,7 +317,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  	svm_set_intercept(svm, INTERCEPT_INVD);
  	svm_set_intercept(svm, INTERCEPT_INVLPG);
  	svm_set_intercept(svm, INTERCEPT_INVLPGA);
-@@ -1181,6 +1201,8 @@
+@@ -1181,6 +1208,8 @@
  	svm_set_intercept(svm, INTERCEPT_XSETBV);
  	svm_set_intercept(svm, INTERCEPT_RDPRU);
  	svm_set_intercept(svm, INTERCEPT_RSM);
@@ -279,7 +326,17 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  
  	if (!kvm_mwait_in_guest(vcpu->kvm)) {
  		svm_set_intercept(svm, INTERCEPT_MONITOR);
-@@ -2317,6 +2339,7 @@
+@@ -1296,6 +1325,9 @@
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 
++	svm->cpuid_native_armed = false;
++	svm->cpuid_native_deadline =
++		jiffies + msecs_to_jiffies(KVM_AAVM_CPUID_NATIVE_GRACE_MS);
+ 	svm->spec_ctrl = 0;
+ 	svm->virt_spec_ctrl = 0;
+ 
+@@ -2317,6 +2349,7 @@
  	/* Both #GP cases have zero error_code */
  	if (error_code)
  		goto reinject;
@@ -287,7 +344,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  
  	/* Decode the instruction for usage later */
  	if (x86_decode_emulated_instruction(vcpu, 0, NULL, 0) != EMULATION_OK)
-@@ -3160,10 +3183,10 @@
+@@ -3160,10 +3193,10 @@
  		 * Suppress BTF as KVM doesn't virtualize BTF, but there's no
  		 * way to communicate lack of support to the guest.
  		 */
@@ -302,7 +359,16 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  
  		if (data & DEBUGCTL_RESERVED_BITS)
  			return 1;
-@@ -3384,7 +3407,8 @@
+@@ -3318,7 +3351,7 @@
+ 	return 0;
+ }
+ 
+-static int vmmcall_interception(struct kvm_vcpu *vcpu)
++static __maybe_unused int vmmcall_interception(struct kvm_vcpu *vcpu)
+ {
+ 	/*
+ 	 * Inject a #UD if L2 is active and the VMMCALL isn't a Hyper-V TLB
+@@ -3384,7 +3417,8 @@
  	[SVM_EXIT_TASK_SWITCH]			= task_switch_interception,
  	[SVM_EXIT_SHUTDOWN]			= shutdown_interception,
  	[SVM_EXIT_VMRUN]			= vmrun_interception,
@@ -312,7 +378,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  	[SVM_EXIT_VMLOAD]			= vmload_interception,
  	[SVM_EXIT_VMSAVE]			= vmsave_interception,
  	[SVM_EXIT_STGI]				= stgi_interception,
-@@ -4417,6 +4441,45 @@
+@@ -4417,6 +4451,45 @@
  	return 1;
  }
  
@@ -358,7 +424,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  static fastpath_t svm_exit_handlers_fastpath(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_svm *svm = to_svm(vcpu);
-@@ -4429,8 +4492,19 @@
+@@ -4429,8 +4502,19 @@
  	if (!nrips || !control->next_rip)
  		return EXIT_FASTPATH_NONE;
  
@@ -379,7 +445,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  
  	switch (control->exit_code) {
  	case SVM_EXIT_MSR:
-@@ -4480,10 +4554,54 @@
+@@ -4480,10 +4564,74 @@
  	guest_state_exit_irqoff();
  }
  
@@ -426,6 +492,26 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
 +	       msr_write_intercepted(svm, MSR_AMD64_PERF_CNTR_GLOBAL_CTL);
 +}
 +
++static void svm_maybe_enable_cpuid_passthrough(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++
++	/*
++	 * SVM has a single CPUID intercept bit, not a per-leaf bitmap.  Keep
++	 * KVM's architectural CPUID emulation through reset/firmware, then use
++	 * host-passthrough CPUID only for the non-confidential L1 VMCB.  Do not
++	 * touch VMCB02 here: nested_svm_vmcb02_recalc_intercepts() must retain
++	 * VMCB12's CPUID ownership whenever L1 requests it.
++	 */
++	if (svm->cpuid_native_armed || is_guest_mode(vcpu) ||
++	    is_sev_guest(vcpu) ||
++	    time_before(jiffies, svm->cpuid_native_deadline))
++		return;
++
++	svm->cpuid_native_armed = true;
++	svm_clr_intercept(svm, INTERCEPT_CPUID);
++}
++
  static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
  {
  	bool force_immediate_exit = run_flags & KVM_RUN_FORCE_IMMEDIATE_EXIT;
@@ -434,7 +520,16 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  	unsigned enter_flags = 0;
  
  	if (!msr_write_intercepted(svm, MSR_IA32_SPEC_CTRL))
-@@ -4547,6 +4665,7 @@
+@@ -4521,6 +4669,8 @@
+ 		return EXIT_FASTPATH_EXIT_USERSPACE;
+ 	}
+ 
++	svm_maybe_enable_cpuid_passthrough(vcpu);
++
+ 	sync_lapic_to_cr8(vcpu);
+ 
+ 	if (unlikely(svm->asid != svm->vmcb->control.asid)) {
+@@ -4547,6 +4697,7 @@
  	else if (likely(!(vcpu->arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT)))
  		svm_set_dr6(vcpu, DR6_ACTIVE_LOW);
  
@@ -442,7 +537,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  	clgi();
  
  	/*
-@@ -4603,6 +4722,32 @@
+@@ -4603,6 +4754,32 @@
  	if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
  		kvm_after_interrupt(vcpu);
  
@@ -475,7 +570,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  	sync_cr8_to_lapic(vcpu);
  
  	svm->next_rip = 0;
-@@ -4652,7 +4797,29 @@
+@@ -4652,7 +4829,29 @@
  	if (is_guest_mode(vcpu))
  		svm->nested.ctl.next_rip = svm->vmcb->control.next_rip;
  
@@ -506,7 +601,7 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  }
  
  static void svm_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa,
-@@ -4731,6 +4898,21 @@
+@@ -4731,6 +4930,21 @@
  static void svm_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
  {
  	struct vcpu_svm *svm = to_svm(vcpu);
@@ -528,9 +623,8 @@ diff -urN a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
  
  	/*
  	 * SVM doesn't provide a way to disable just XSAVES in the guest, KVM
-diff -urN a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
---- a/arch/x86/kvm/svm/svm.h	2026-08-31 23:52:59.537557601 +0800
-+++ b/arch/x86/kvm/svm/svm.h	2026-08-31 23:54:48.600834951 +0800
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
 @@ -217,6 +217,13 @@
  	u64 vmcb12_gpa;
  	u64 last_vmcb12_gpa;
@@ -545,7 +639,7 @@ diff -urN a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
  
  	/*
  	 * The MSR permissions map used for vmcb02, which is the merge result
-@@ -287,6 +294,18 @@
+@@ -287,6 +294,22 @@
  	u32 sysenter_esp_hi;
  	u32 sysenter_eip_hi;
  	uint64_t tsc_aux;
@@ -561,10 +655,14 @@ diff -urN a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
 +		u32 edx;
 +		bool valid;
 +	} cpuid0;
++
++	/* Kept false through reset/firmware and armed only for VMCB01. */
++	bool cpuid_native_armed;
++	unsigned long cpuid_native_deadline;
  
  	u64 msr_decfg;
  
-@@ -784,7 +803,8 @@
+@@ -784,7 +807,8 @@
  BUILD_SVM_MSR_BITMAP_HELPERS(void, clear, __clear)
  BUILD_SVM_MSR_BITMAP_HELPERS(void, set, __set)
  
@@ -574,9 +672,8 @@ diff -urN a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
  
  /* svm.c */
  extern bool dump_invalid_vmcb;
-diff -urN a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
---- a/arch/x86/kvm/x86.c	2026-08-31 23:52:59.538391320 +0800
-+++ b/arch/x86/kvm/x86.c	2026-08-31 23:52:59.543028369 +0800
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
 @@ -543,6 +543,9 @@
  		return 0;
  
@@ -595,26 +692,8 @@ diff -urN a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
  EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_mmio);
  EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_fast_mmio);
  EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_inj_virq);
-diff -urN a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
---- a/arch/x86/kvm/cpuid.c	2026-08-31 23:52:59.538391320 +0800
-+++ b/arch/x86/kvm/cpuid.c	2026-09-02 00:00:00.000000000 +0800
-@@ -2154,2 +2154,11 @@
--	trace_kvm_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
--			used_max_basic);
-+	/*
-+	 * AMD/Hygon reserve the Intel mitigation bits in CPUID.7.0.EDX.
-+	 * KVM's host capability aliases may otherwise leak SPEC_CTRL, STIBP,
-+	 * and SSBD into an AMD-compatible guest, which is both architecturally
-+	 * wrong and visible to timing/signature detectors.  Keep AMD's native
-+	 * mitigation enumeration in 0x80000008.EBX unchanged.
-+	 */
-+	if (function == 7 && index == 0 && vcpu->arch.is_amd_compatible)
-+		*edx &= ~(BIT(26) | BIT(27) | BIT(31));
-+	trace_kvm_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
-+			used_max_basic);
-diff -urN a/include/linux/kvm_host.h b/include/linux/kvm_host.h
---- a/include/linux/kvm_host.h	2026-08-31 23:52:59.540581977 +0800
-+++ b/include/linux/kvm_host.h	2026-08-31 23:52:59.543413020 +0800
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
 @@ -882,11 +882,15 @@
  	pr_err("kvm [%i]: " fmt, task_pid_nr(current), ## __VA_ARGS__)
  #define kvm_info(fmt, ...) \

@@ -2415,7 +2415,7 @@ class KernelTests(unittest.TestCase):
         self.assertIn('if deb.name.startswith("linux-image-") and "-dbg_" not in deb.name', source)
         self.assertNotIn('for image in sorted(BOOT_DIR.glob("vmlinuz-*-tkg-*")):\n        _validate_tkg_boot_config', source)
 
-    def test_amd72_kernel_patch_uses_svme_gated_vmcb01_cpuid_policy(self):
+    def test_amd72_kernel_patch_uses_delayed_vmcb01_cpuid_policy(self):
         project = Path(__file__).parents[1]
         patch_file = project / "amd72-test.mypatch"
         text = patch_file.read_text(encoding="utf-8")
@@ -2423,13 +2423,25 @@ class KernelTests(unittest.TestCase):
         self.assertNotIn("kvm_hv_hypercall_enabled(vcpu)", text)
         self.assertNotIn("nested.save.cpl == 3", text)
         self.assertNotIn("vmcb_clr_intercept(&vmcb02->control, INTERCEPT_CPUID)", text)
-        self.assertNotIn("nested_vmcb02", text)
         self.assertNotIn("native_cpuid", text)
         self.assertNotIn("guest_cpu_cap_has(vcpu, X86_FEATURE_SVM)", text)
-        self.assertIn("if (svme)", text)
+        self.assertIn("#define KVM_AAVM_CPUID_NATIVE_GRACE_MS\t30000", text)
+        self.assertIn("unsigned long cpuid_native_deadline;", text)
+        self.assertIn("jiffies + msecs_to_jiffies(KVM_AAVM_CPUID_NATIVE_GRACE_MS);", text)
+        self.assertIn("static void svm_maybe_enable_cpuid_passthrough", text)
+        self.assertIn("svm->cpuid_native_armed || is_guest_mode(vcpu) ||", text)
+        self.assertIn("is_sev_guest(vcpu) ||", text)
+        self.assertIn("time_before(jiffies, svm->cpuid_native_deadline)", text)
+        self.assertIn("nested_svm_vmcb02_recalc_intercepts() must retain", text)
+        self.assertIn("KVM-AAVM: CPUID remains governed by the architectural L0/L1 merge.", text)
+        self.assertIn("VMCB01 and VMCB12 both leave the global bit clear", text)
+        self.assertIn("Do not add a direct VMCB02 clear here", text)
+        self.assertIn("if (svme || svm->cpuid_native_armed)", text)
         self.assertIn("if (is_guest_mode(vcpu))", text)
         self.assertIn("svm->vmcb01.ptr->save.efer & EFER_SVME", text)
-        self.assertIn("if (vcpu->arch.efer & EFER_SVME)", text)
+        self.assertIn("if ((vcpu->arch.efer & EFER_SVME) || svm->cpuid_native_armed)", text)
+        self.assertIn("svm->cpuid_native_armed = true;", text)
+        self.assertIn("svm->cpuid_native_armed = false;", text)
         self.assertIn("case SVM_EXIT_CPUID:", text)
         self.assertIn("if (kvm_rax_read(vcpu) == 0)", text)
         self.assertIn("return NESTED_EXIT_HOST;", text)
@@ -2567,9 +2579,10 @@ class KernelTests(unittest.TestCase):
         self.assertIn("cpuid_l2_forwarded_candidates=17067", result.stdout)
         self.assertIn("cpuid_path_result=CORRELATED", result.stdout)
         self.assertIn(
-            'svm.count("svm_clr_intercept(svm, INTERCEPT_CPUID);") == 2',
+            'svm.count("svm_clr_intercept(svm, INTERCEPT_CPUID);") == 3',
             verifier.read_text(encoding="utf-8"),
         )
+        self.assertIn("cpuid_vmcbo1_handoff=", verifier.read_text(encoding="utf-8"))
         self.assertIn(
             "nested_cpuid_leaf0_short_reentry=",
             verifier.read_text(encoding="utf-8"),
@@ -2778,6 +2791,19 @@ class KernelTests(unittest.TestCase):
             with self.assertRaisesRegex(AppError, "VMCB01 保存的 L1 EFER"):
                 kernel._validate_amd_cpuid_virtualization_patch(patch_file)
 
+    def test_amd_cpuid_validation_rejects_missing_reset_grace_guard(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text = text.replace(
+                "time_before(jiffies, svm->cpuid_native_deadline)",
+                "removed_cpuid_native_deadline_guard",
+            )
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "jiffies reset grace"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
+
     def test_amd_cpuid_validation_rejects_cpl3_vmcb02_branch(self):
         project = Path(__file__).parents[1]
         with tempfile.TemporaryDirectory() as temporary:
@@ -2797,7 +2823,7 @@ class KernelTests(unittest.TestCase):
             patch_file = Path(temporary) / "amd-test.mypatch"
             text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
             text = text.replace(
-                "+\tif (svme)\n",
+                "+\tif (svme || svm->cpuid_native_armed)\n",
                 "+\tif (kvm_hv_hypercall_enabled(vcpu) &&\n"
                 "+\t    svme)\n",
             )

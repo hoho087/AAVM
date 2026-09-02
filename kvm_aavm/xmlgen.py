@@ -622,8 +622,8 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
     if virtualization:
         # Keep SVM/VMX hidden unless the guest explicitly uses Core
         # Isolation/VBS.  KVM must still virtualize CPUID while it is hidden;
-        # nested Hyper-V opts into the guarded VMCB01 fastpath through
-        # EFER.SVME.
+        # VMCB01 owns the guarded native handoff; EFER.SVME can arm it early
+        # for nested Hyper-V, while the reset grace covers ordinary Windows.
         _sub(
             cpu, "feature",
             policy="require" if guest_core_isolation_active else "disable",

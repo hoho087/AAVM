@@ -116,8 +116,8 @@ def _cpu_topology() -> tuple[list[list[int]], int]:
 def vm_cpu_layout(info: dict, vcpus: int, shared_emulator_cores: int = 0) -> dict:
     """Build an SMT-aware guest topology and an optional physical CPU map.
 
-    ``shared_emulator_cores`` is reserved for the full-topology AMD
-    SVME-gated CPUID profile.  In that profile every native APIC ID must have
+    ``shared_emulator_cores`` is reserved for the full-topology AMD native
+    CPUID-handoff profile.  In that profile every native APIC ID must have
     a matching vCPU, so QEMU's emulator thread shares the final complete SMT
     cores instead of requiring CPUs outside the guest pin set.
     """
@@ -145,11 +145,11 @@ def vm_cpu_layout(info: dict, vcpus: int, shared_emulator_cores: int = 0) -> dic
             "emulator_cpus": [],
         }
 
-    # In the AMD SVME-gated mode, CPUID reports the physical CPU's native APIC
-    # ID after the outer Hyper-V enables EFER.SVME.  Pin vCPU N to the host
+    # In the AMD delayed-handoff mode, CPUID reports the physical CPU's native
+    # APIC ID after the reset grace (or after EFER.SVME).  Pin vCPU N to the host
     # logical CPU whose native APIC ID is N so Hyper-V's one-socket
-    # core/thread topology remains coherent.  Firmware and the ordinary
-    # Windows boot path still use KVM's intercepted CPUID model.
+    # core/thread topology remains coherent.  Firmware and the first reset
+    # grace period use KVM's intercepted CPUID model before the handoff.
     native_apic_ids: dict[int, int] = {}
     for cpu, apic_id in info.get("native_apic_ids", {}).items():
         try:

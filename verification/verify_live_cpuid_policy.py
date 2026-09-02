@@ -113,15 +113,40 @@ def main() -> int:
     nested_source = NESTED_SOURCE.read_text(encoding="utf-8")
     x86_source = X86_SOURCE.read_text(encoding="utf-8")
     cpuid_source = CPUID_SOURCE.read_text(encoding="utf-8")
-    gate = (
+    cpuid_vmcbo1_handoff = (
         "bool svme = vcpu->arch.efer & EFER_SVME;" in svm
         and "svme = svm->vmcb01.ptr->save.efer & EFER_SVME;" in svm
-        and svm.count("svm_clr_intercept(svm, INTERCEPT_CPUID);") == 2
+        and "bool cpuid_native_armed;" in svm_header
+        and "unsigned long cpuid_native_deadline;" in svm_header
+        and "#define KVM_AAVM_CPUID_NATIVE_GRACE_MS\t30000" in svm
+        and "svm->cpuid_native_armed = true;" in svm
+        and "svm->cpuid_native_armed = false;" in svm
+        and "jiffies + msecs_to_jiffies(KVM_AAVM_CPUID_NATIVE_GRACE_MS);" in svm
+        and "svme || svm->cpuid_native_armed" in svm
+        and "(vcpu->arch.efer & EFER_SVME) || svm->cpuid_native_armed" in svm
+        and "static void svm_maybe_enable_cpuid_passthrough(struct kvm_vcpu *vcpu)" in svm
+        and "svm->cpuid_native_armed || is_guest_mode(vcpu) ||" in svm
+        and "is_sev_guest(vcpu) ||" in svm
+        and "time_before(jiffies, svm->cpuid_native_deadline)" in svm
+        and re.search(
+            r"if \(pre_svm_run\(vcpu\)\) \{[\s\S]{0,600}?\}\s*"
+            r"svm_maybe_enable_cpuid_passthrough\(vcpu\);",
+            svm,
+        ) is not None
+        and svm.count("svm_clr_intercept(svm, INTERCEPT_CPUID);") == 3
         and svm.count("svm_set_intercept(svm, INTERCEPT_CPUID);") == 2
         and "native_cpuid" not in svm
         and "else if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SVM))" not in svm
     )
-    no_vmcb02_clear = "vmcb_clr_intercept(&vmcb02->control, INTERCEPT_CPUID);" not in nested_source
+    no_vmcb02_clear = re.search(
+        r"vmcb_(?:set|clr)_intercept\(\s*(?:&\s*)?vmcb02"
+        r"[^\n]*,\s*INTERCEPT_CPUID\s*\)",
+        nested_source,
+    ) is None
+    vmcb02_cpuid_merge = all(marker in nested_source for marker in (
+        "vmcb02->control.intercepts[i] = vmcb01->control.intercepts[i];",
+        "vmcb02->control.intercepts[i] |= vmcb12_ctrl->intercepts[i];",
+    ))
     amd_cpuid_signature_mask = all(marker in cpuid_source for marker in (
         "AMD/Hygon reserve the Intel mitigation bits in CPUID.7.0.EDX.",
         "if (function == 7 && index == 0 && vcpu->arch.is_amd_compatible)",
@@ -199,9 +224,11 @@ def main() -> int:
     print(f"vermagic={vermagic}")
     print(f"module_params=nested={nested},npt={npt},avic={avic}")
     print(f"vm_state={vm_state}")
-    print(f"svme_gate={'present' if gate else 'absent'}")
+    print(f"cpuid_vmcbo1_handoff={'present' if cpuid_vmcbo1_handoff else 'absent'}")
+    print(f"svme_sticky_arm={'present' if 'cpuid_native_armed' in svm else 'absent'}")
     print(f"amd_cpuid_leaf7_signature_mask={'present' if amd_cpuid_signature_mask else 'absent'}")
     print(f"vmcb02_cpuid_clear={'absent' if no_vmcb02_clear else 'present'}")
+    print(f"vmcb02_cpuid_merge={'present' if vmcb02_cpuid_merge else 'absent'}")
     print(f"nested_cpuid_leaf0_l0={'present' if nested_leaf0 else 'absent'}")
     print(f"nested_cpuid_leaf0_irqoff_fastpath={'present' if nested_leaf0_fastpath else 'absent'}")
     print(f"nested_cpuid_leaf0_short_reentry={'present' if nested_leaf0_short_reentry else 'absent'}")
@@ -233,12 +260,14 @@ def main() -> int:
         failures.append("kvm_amd npt parameter is disabled")
     if avic.upper() not in {"Y", "1"}:
         failures.append("kvm_amd avic parameter is disabled")
-    if not gate:
-        failures.append("Linux 7.2 SVME-gated CPUID source markers are missing")
+    if not cpuid_vmcbo1_handoff:
+        failures.append("Linux 7.2 delayed VMCB01 CPUID handoff source markers are missing")
     if not amd_cpuid_signature_mask:
         failures.append("AMD CPUID leaf 7 EDX signature mask is missing")
     if not no_vmcb02_clear:
         failures.append("nested.c directly clears VMCB02 CPUID intercept")
+    if not vmcb02_cpuid_merge:
+        failures.append("nested.c is missing the upstream VMCB01/VMCB12 intercept OR merge")
     if not nested_leaf0:
         failures.append("nested.c is missing the measured L2 CPUID leaf-0 L0 route")
     if not nested_leaf0_fastpath:

@@ -151,9 +151,10 @@ CPUID 快速路徑的安全邊界如下：
 
 - AMD SVM 只有全域 `INTERCEPT_CPUID`，沒有 per-leaf bitmap；不能粗暴清除 nested VMCB02
   intercept，否則會繞過 Hyper-V 對其他 leaf 的 ownership，可能讓 Windows 卡死。
-- 韌體、一般 Windows 開機及隱藏 guest SVM/VMX 的 VM 一律使用 KVM CPUID 模型；隱藏 SVM
-  不代表可安全回傳主機 CPUID，否則會洩漏主機拓撲與客體未宣告的功能。只有 nested L1 寫入
-  `EFER.SVME` 後，VMCB01 才可依既有 L0/L1 ownership 規則解除 intercept。
+- 韌體與 Windows 早期開機的前 30 秒使用 KVM CPUID 模型；每個 non-SEV vCPU 的 reset grace
+  結束後，會只對 VMCB01 黏著開啟 CPUID passthrough。nested L1 寫入 `EFER.SVME` 可提早 arm；
+  Hyper-V 暫時清除 SVME 時不會把 intercept 重新打開。隱藏 SVM 不是條件，也不會據此在早期
+  開機洩漏主機拓撲或未宣告功能。每次 vCPU reset 都會重新計時。
 - 先前的 `svme-gated-native` profile 會在下一次套用去虛擬化設定時遷移為
   `resources.cpuid_policy=intercepted`；XML 產生期間也會以 intercepted 相容處理舊 profile。
 - AMD-compatible guest 的 `CPUID.7.0.EDX` 清除 Intel 專用的 `SPEC_CTRL`、`STIBP` 與
@@ -161,12 +162,14 @@ CPUID 快速路徑的安全邊界如下：
 - 只對受控的 leaf 0 快取結果，並在 IRQ-off、無 pending event/request、PMU/TLB/ERAP 狀態
   安全且有 NRIPS 時直接重入 L2；其他 leaf、CPUID faulting、SEV-ES 或不符合 guard 的情況
   全部回到完整上游 handler。
-- nested VMCB02 仍保留 L0/L1 intercept 合併；不以 VMRUN 當下 CPL 或靜態位元清除來取代它。
+- nested VMCB02 仍保留上游 L0/L1 intercept 合併，不會被直接清除。當 VMCB01 已透傳且
+  VMCB12 也未要求 CPUID exit 時，VMCB02 會自然透傳；若 L1 要求 CPUID ownership，合併結果
+  仍會保留 exit。這是唯一納入的 VMCB02 原生嘗試，不以 VMRUN 當下 CPL 或靜態位元取代它。
 - 新版 `#DB` 與舊版 nested NPF/`Memory > VMM` 路徑亦有獨立 guard；實驗 NPF value cache
   已移除，僅保留 generation 檢查的 VMCB12 writable map reuse。
 
-這些修改的目標是讓常見 CPUID 接近原生路徑，而不是偽造計時結果；是否改善 VMAware 必須
-在沒有 profiler 時另行量測。profiler 只用於歸因：
+這些修改的目標是讓常見 CPUID 接近原生路徑，而不是偽造計時結果；是否改善 VMAware 必須在
+VM reset 後至少 30 秒、且沒有 profiler 時另行量測。profiler 只用於歸因：
 
 ```bash
 # 先在 profiler 關閉時執行 VMAware TIMER，記錄正式結果

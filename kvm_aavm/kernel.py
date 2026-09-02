@@ -176,12 +176,13 @@ def _validate_hypercall_patch(patch: Path) -> None:
 def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
     """Require the Linux 7.2 CPUID/#DB and nested-NPF guarded fastpaths.
 
-    Firmware and an ordinary Windows kernel retain KVM CPUID virtualization.
-    VMCB01 may pass CPUID through only after EFER.SVME is enabled.  Nested
-    VMCB02 keeps the architectural OR-merged L0/L1 intercepts, so this policy
-    must not rewrite the hardware intercept from a CPL snapshot.  L2 leaf 0 is
-    handled from a precomputed KVM CPUID cache in the IRQ-off VM-Exit fastpath;
-    all other leaves retain normal L1 ownership.  The nested special handler is
+    Firmware and early Windows bring-up retain KVM CPUID virtualization.  A
+    non-confidential L1 may pass CPUID through only after a jiffies-based reset
+    grace period, or when it has successfully enabled SVM.  Nested VMCB02 keeps
+    the architectural OR-merged L0/L1 intercepts, so this policy must not
+    rewrite the hardware intercept from a CPL snapshot.  L2 leaf 0 is handled
+    from a precomputed KVM CPUID cache in the IRQ-off VM-Exit fastpath; all
+    other leaves retain normal L1 ownership.  The nested special handler is
     retained as the correctness fallback when fastpath emulation is disallowed.
     """
     if not patch.name.startswith("amd"):
@@ -202,14 +203,14 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
         if line.startswith(("+", " ")) and not line.startswith("+++")
     )
     recalc_gated = re.findall(
-        r"if \(svme\)\s*\n"
+        r"if \(svme \|\| svm->cpuid_native_armed\)\s*\n"
         r"\s*svm_clr_intercept\(svm, INTERCEPT_CPUID\);\s*\n"
         r"\s*else\s*\n"
         r"\s*svm_set_intercept\(svm, INTERCEPT_CPUID\);",
         added_text,
     )
     init_gated = re.findall(
-        r"if \(vcpu->arch\.efer & EFER_SVME\)\s*\n"
+        r"if \(\(vcpu->arch\.efer & EFER_SVME\) \|\| svm->cpuid_native_armed\)\s*\n"
         r"\s*svm_clr_intercept\(svm, INTERCEPT_CPUID\);\s*\n"
         r"\s*else\s*\n"
         r"\s*svm_set_intercept\(svm, INTERCEPT_CPUID\);",
@@ -218,6 +219,32 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
     nested_l1_efer = re.findall(
         r"if \(is_guest_mode\(vcpu\)\)\s*\n"
         r"\s*svme = svm->vmcb01\.ptr->save\.efer & EFER_SVME;",
+        added_text,
+    )
+    sticky_arm = (
+        "bool cpuid_native_armed;" in added_text
+        and "svm->cpuid_native_armed = true;" in added_text
+        and "svm->cpuid_native_armed = false;" in added_text
+    )
+    delayed_vmcbo1_handoff = all(marker in added_text for marker in (
+        "#define KVM_AAVM_CPUID_NATIVE_GRACE_MS\t30000",
+        "unsigned long cpuid_native_deadline;",
+        "jiffies + msecs_to_jiffies(KVM_AAVM_CPUID_NATIVE_GRACE_MS);",
+        "static void svm_maybe_enable_cpuid_passthrough(struct kvm_vcpu *vcpu)",
+        "svm_maybe_enable_cpuid_passthrough(vcpu);",
+    )) and re.search(
+        r"static void svm_maybe_enable_cpuid_passthrough"
+        r"\(struct kvm_vcpu \*vcpu\)"
+        r"[\s\S]{0,2200}?if \(svm->cpuid_native_armed \|\| is_guest_mode\(vcpu\) \|\|"
+        r"[\s\S]{0,300}?is_sev_guest\(vcpu\) \|\|"
+        r"[\s\S]{0,300}?time_before\(jiffies, svm->cpuid_native_deadline\)\)"
+        r"[\s\S]{0,300}?svm->cpuid_native_armed = true;"
+        r"[\s\S]{0,300}?svm_clr_intercept\(svm, INTERCEPT_CPUID\);",
+        added_text,
+    ) is not None
+    nested_arm_sev_safe = re.findall(
+        r"if \(!is_sev_guest\(vcpu\)\)\s*"
+        r"\n\s*svm->cpuid_native_armed = true;",
         added_text,
     )
     nested_leaf0 = re.findall(
@@ -286,6 +313,11 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
         "nested_svm_try_cached_npf_exit",
         "npf_cache[4]",
     ))
+    nested_vmcb02_merge_note = all(marker in added_text for marker in (
+        "KVM-AAVM: CPUID remains governed by the architectural L0/L1 merge.",
+        "VMCB01 and VMCB12 both leave the global bit clear",
+        "Do not add a direct VMCB02 clear here",
+    ))
     vmcb12_map_reuse = all(marker in added_text for marker in (
         "struct kvm_host_map vmcb12_map;",
         "nested_svm_release_vmcb12_map",
@@ -293,9 +325,13 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
         "map->gfn != gpa_to_gfn(svm->nested.vmcb12_gpa)",
     ))
     problems = []
-    if len(recalc_gated) != 1 or len(init_gated) != 1:
+    if len(recalc_gated) != 1 or len(init_gated) != 1 or not sticky_arm:
         problems.append(
-            "必須在 recalc 與 init_vmcb 僅以 L1 EFER.SVME 控制 VMCB01 CPUID intercept"
+            "必須在 recalc/init_vmcb 使用 EFER.SVME 加 sticky arm 控制 VMCB01 CPUID intercept"
+        )
+    if not delayed_vmcbo1_handoff or len(nested_arm_sev_safe) != 1:
+        problems.append(
+            "必須保留以 jiffies reset grace 驅動、排除 SEV/L2 的 VMCB01 CPUID handoff"
         )
     if len(nested_l1_efer) != 1:
         problems.append("nested active 時必須使用 VMCB01 保存的 L1 EFER.SVME")
@@ -317,24 +353,37 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
         problems.append("必須保留 debugger/NMI fallback 的 nested #DB 同輪直接反射")
     if nested_npf_value_cache:
         problems.append("不得保留已量測為負收益的 nested NPF value cache")
+    if not nested_vmcb02_merge_note:
+        problems.append("必須保留 VMCB02 的上游 L0/L1 CPUID OR 合併說明")
     if not vmcb12_map_reuse:
         problems.append("必須保留單次 nested run、generation-checked 的 VMCB12 map reuse")
     if not re.search(r"trace_kvm_cpuid\(0, (?:index|kvm_ecx_read\(vcpu\))", added_text) or \
             "EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_cpuid);" not in added_text:
         problems.append("必須匯出並保留 kvm_cpuid tracepoint，以驗證 fastpath 實際命中")
-    if len(added_cpuid) != 4:
+    added_cpuid_ops = re.findall(
+        r"svm_(?:set|clr)_intercept\(svm, INTERCEPT_CPUID\);",
+        added_text,
+    )
+    if len(added_cpuid_ops) != 5:
         problems.append("CPUID intercept 變更數量不符 Linux 7.2 policy")
     if re.search(
         r"\bnative_cpuid\b|guest_cpu_cap_has\(vcpu, X86_FEATURE_SVM\)",
         added_text,
     ):
         problems.append("不得因 guest 隱藏 SVM 而讓 VMCB01 原生執行 CPUID")
-    if re.search(
-        r"(?:vmcb02|nested_vmcb02|nested\.save\.cpl|save\.cpl).*"
-        r"(?:INTERCEPT_CPUID|CPUID)",
+    direct_vmcb02_cpuid = re.search(
+        r"vmcb_(?:set|clr)_intercept\(\s*(?:&\s*)?"
+        r"(?:vmcb02\b|[^,\n]*->nested\.vmcb02)[^\n]*,\s*"
+        r"INTERCEPT_CPUID\s*\)",
         added_text,
-        re.IGNORECASE | re.DOTALL,
-    ) or re.search(
+    )
+    cpl_cpuid_policy = re.search(
+        r"(?:vmcb02->save\.cpl|nested\.save\.cpl|save\.cpl)"
+        r"[\s\S]{0,500}?(?:INTERCEPT_CPUID|CPUID)",
+        added_text,
+        re.IGNORECASE,
+    )
+    if direct_vmcb02_cpuid or cpl_cpuid_policy or re.search(
         r"vmcb_(?:set|clr)_intercept\([^\n]*INTERCEPT_CPUID",
         added_text,
     ):
