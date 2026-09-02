@@ -1807,8 +1807,8 @@ if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
   echo "PCIE_BRIDGE 0x000e                                -> PCIE_BRIDGE 0x$pcibridge_1022  // PCIe Bridge"
   sed -i "$header_pci" -Ee "s/QEMU               0x1234/QEMU               0x1022/"
   sed -i "$header_pci" -Ee "s/VMWARE             0x15ad/VMWARE             0x1022/"
-#  sed -i "$header_pci" -Ee "s/QUMRANET    0x1af4/QUMRANET    0x1022/"
-  sed -i "$header_pci" -Ee "s/QUMRANET 0x1af4/QUMRANET 0x1022/"
+  sed -i "$header_pci" -Ee 's/^#define[[:space:]]+PCI_VENDOR_ID_REDHAT_QUMRANET[[:space:]]+0x[0-9A-Fa-f]+/#define PCI_VENDOR_ID_REDHAT_QUMRANET    0x1022/'
+  sed -i "$header_pci" -Ee 's/^#define[[:space:]]+PCI_SUBVENDOR_ID_REDHAT_QUMRANET[[:space:]]+0x[0-9A-Fa-f]+/#define PCI_SUBVENDOR_ID_REDHAT_QUMRANET 0x1022/'
   sed -i "$header_pci" -Ee "s/REDHAT             0x1b36/REDHAT             0x1022/"
   sed -i "$header_pci" -Ee "s/PCIE_RP     0x000c/PCIE_RP     0x$rootport_1022/"
   sed -i "$header_pci" -Ee "s/XHCI        0x000d/XHCI        0x$xhci_1022/"
@@ -1824,8 +1824,8 @@ else
   echo "PCIE_BRIDGE 0x000e                                -> PCIE_BRIDGE 0x$pcibridge_8086  // PCIe Controller"
   sed -i "$header_pci" -Ee "s/QEMU               0x1234/QEMU               0x8086/"
   sed -i "$header_pci" -Ee "s/VMWARE             0x15ad/VMWARE             0x8086/"
-#  sed -i "$header_pci" -Ee "s/QUMRANET    0x1af4/QUMRANET    0x8086/"
-  sed -i "$header_pci" -Ee "s/QUMRANET 0x1af4/QUMRANET 0x8086/"
+  sed -i "$header_pci" -Ee 's/^#define[[:space:]]+PCI_VENDOR_ID_REDHAT_QUMRANET[[:space:]]+0x[0-9A-Fa-f]+/#define PCI_VENDOR_ID_REDHAT_QUMRANET    0x8086/'
+  sed -i "$header_pci" -Ee 's/^#define[[:space:]]+PCI_SUBVENDOR_ID_REDHAT_QUMRANET[[:space:]]+0x[0-9A-Fa-f]+/#define PCI_SUBVENDOR_ID_REDHAT_QUMRANET 0x8086/'
   sed -i "$header_pci" -Ee "s/REDHAT             0x1b36/REDHAT             0x8086/"
   sed -i "$header_pci" -Ee "s/PCIE_RP     0x000c/PCIE_RP     0x$rootport_8086/"
   sed -i "$header_pci" -Ee "s/XHCI        0x000d/XHCI        0x$xhci_8086/"

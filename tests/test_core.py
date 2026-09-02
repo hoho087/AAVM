@@ -1279,6 +1279,15 @@ class BuildTests(unittest.TestCase):
         self.assertNotIn(
             's/0x293e;/0x$hdaudio_1022;/', source,
         )
+        # QEMU aligns the vendor and subsystem macro values differently;
+        # replacements must target each macro name instead of assuming a
+        # fixed number of spaces.
+        self.assertIn(
+            "PCI_VENDOR_ID_REDHAT_QUMRANET[[:space:]]+", source,
+        )
+        self.assertIn(
+            "PCI_SUBVENDOR_ID_REDHAT_QUMRANET[[:space:]]+", source,
+        )
         ovmf = (Path(__file__).parents[1] / "ovmfpatch.sh").read_text(
             encoding="utf-8",
         )
