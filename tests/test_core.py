@@ -1861,6 +1861,7 @@ class VmTests(unittest.TestCase):
     def test_rebuild_artifacts_preserves_identity_and_uses_next_generation(self):
         runner = Mock()
         value = profile()
+        value["resources"]["cpuid_policy"] = "svme-gated-native"
         old_xml = build_domain_xml(value, stage="final")
         rebuilt = profile()
         rebuilt["artifact_generation"] = 2
@@ -1884,6 +1885,7 @@ class VmTests(unittest.TestCase):
                 patch.object(vm, "clear_pending"):
             vm.rebuild_artifacts("test-vm", runner)
         build.assert_called_once_with("test-vm", value, runner, generation=2)
+        self.assertEqual(value["resources"]["cpuid_policy"], "intercepted")
         paths.assert_called_once_with(old_xml, rebuilt["paths"])
         self.assertIs(value["identity"], original_identity)
 

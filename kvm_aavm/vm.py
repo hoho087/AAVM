@@ -1635,6 +1635,11 @@ def randomize_all(name: str, runner: Runner) -> None:
     require_root()
     with vm_lock(name):
         profile = load_profile(name)
+        resources = profile.setdefault("resources", {})
+        if resources.get("cpuid_policy") == "svme-gated-native":
+            resources["cpuid_policy"] = "intercepted"
+        else:
+            resources.setdefault("cpuid_policy", "intercepted")
         _ensure_inactive(name, runner)
         old_xml = _dump_xml(name, runner)
         _backup_xml(name, old_xml)
@@ -1660,6 +1665,11 @@ def rebuild_artifacts(name: str, runner: Runner) -> None:
         profile = load_profile(name)
         if profile.get("adopted"):
             raise AppError("Artifact rebuild is available only for deployer-owned VMs.")
+        resources = profile.setdefault("resources", {})
+        if resources.get("cpuid_policy") == "svme-gated-native":
+            resources["cpuid_policy"] = "intercepted"
+        else:
+            resources.setdefault("cpuid_policy", "intercepted")
         _ensure_inactive(name, runner)
         old_xml = _dump_xml(name, runner)
         _backup_xml(name, old_xml)
