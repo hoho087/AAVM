@@ -16,6 +16,7 @@ SVM_SOURCE = SOURCE_ROOT / "arch/x86/kvm/svm/svm.c"
 SVM_HEADER = SOURCE_ROOT / "arch/x86/kvm/svm/svm.h"
 NESTED_SOURCE = SOURCE_ROOT / "arch/x86/kvm/svm/nested.c"
 X86_SOURCE = SOURCE_ROOT / "arch/x86/kvm/x86.c"
+CPUID_SOURCE = SOURCE_ROOT / "arch/x86/kvm/cpuid.c"
 BUILT_MODULE = SOURCE_ROOT / "arch/x86/kvm/kvm-amd.ko"
 LOADED_BUILD_ID_NOTE = Path("/sys/module/kvm_amd/notes/.note.gnu.build-id")
 
@@ -63,15 +64,31 @@ def elf_build_id(path: Path) -> str:
     return match.group(1).lower()
 
 
+def source_release(source_root: Path) -> str:
+    """Read the release encoded by the source tree's top-level Makefile."""
+    makefile = source_root / "Makefile"
+    text = makefile.read_text(encoding="utf-8", errors="replace")
+    values: dict[str, str] = {}
+    for key in ("VERSION", "PATCHLEVEL", "SUBLEVEL", "EXTRAVERSION"):
+        match = re.search(rf"^{key}[ \t]*=[ \t]*(.*)$", text, re.MULTILINE)
+        if match is None:
+            raise ValueError(f"{key} is missing from {makefile}")
+        values[key] = match.group(1).strip()
+    return f"{values['VERSION']}.{values['PATCHLEVEL']}.{values['SUBLEVEL']}{values['EXTRAVERSION']}"
+
+
 def main() -> int:
     failures: list[str] = []
 
-    if (not SVM_SOURCE.is_file() or not SVM_HEADER.is_file() or
-            not NESTED_SOURCE.is_file() or not X86_SOURCE.is_file()):
+    if (not (SOURCE_ROOT / "Makefile").is_file() or
+            not SVM_SOURCE.is_file() or not SVM_HEADER.is_file() or
+            not NESTED_SOURCE.is_file() or not X86_SOURCE.is_file() or
+            not CPUID_SOURCE.is_file()):
         print("svm_source=missing")
         print("svm_header=missing")
         print("nested_source=missing")
         print("x86_source=missing")
+        print("cpuid_source=missing")
         print("result=FAIL")
         print(
             "FAIL: patched Linux 7.2 source tree is missing",
@@ -87,6 +104,7 @@ def main() -> int:
     npt = read_sysfs("/sys/module/kvm_amd/parameters/npt")
     avic = read_sysfs("/sys/module/kvm_amd/parameters/avic")
     vm_state = run_optional("virsh", "domstate", "win11").replace("\r", "").splitlines()[0]
+    source_version = source_release(SOURCE_ROOT)
     live_build_id = loaded_build_id(LOADED_BUILD_ID_NOTE)
     built_build_id = elf_build_id(BUILT_MODULE) if BUILT_MODULE.is_file() else "missing"
 
@@ -94,13 +112,21 @@ def main() -> int:
     svm_header = SVM_HEADER.read_text(encoding="utf-8")
     nested_source = NESTED_SOURCE.read_text(encoding="utf-8")
     x86_source = X86_SOURCE.read_text(encoding="utf-8")
+    cpuid_source = CPUID_SOURCE.read_text(encoding="utf-8")
     gate = (
         "bool svme = vcpu->arch.efer & EFER_SVME;" in svm
         and "svme = svm->vmcb01.ptr->save.efer & EFER_SVME;" in svm
         and svm.count("svm_clr_intercept(svm, INTERCEPT_CPUID);") == 2
         and svm.count("svm_set_intercept(svm, INTERCEPT_CPUID);") == 2
+        and "native_cpuid" not in svm
+        and "else if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SVM))" not in svm
     )
     no_vmcb02_clear = "vmcb_clr_intercept(&vmcb02->control, INTERCEPT_CPUID);" not in nested_source
+    amd_cpuid_signature_mask = all(marker in cpuid_source for marker in (
+        "AMD/Hygon reserve the Intel mitigation bits in CPUID.7.0.EDX.",
+        "if (function == 7 && index == 0 && vcpu->arch.is_amd_compatible)",
+        "*edx &= ~(BIT(26) | BIT(27) | BIT(31));",
+    ))
     nested_leaf0 = bool(re.search(
         r"case SVM_EXIT_CPUID:\s*\n"
         r"[\s\S]{0,800}?"
@@ -164,6 +190,7 @@ def main() -> int:
     ))
 
     print(f"kernel={kernel}")
+    print(f"source_release={source_version}")
     print(f"loaded_srcversion={loaded}")
     print(f"loaded_build_id={live_build_id}")
     print(f"built_build_id={built_build_id}")
@@ -173,6 +200,7 @@ def main() -> int:
     print(f"module_params=nested={nested},npt={npt},avic={avic}")
     print(f"vm_state={vm_state}")
     print(f"svme_gate={'present' if gate else 'absent'}")
+    print(f"amd_cpuid_leaf7_signature_mask={'present' if amd_cpuid_signature_mask else 'absent'}")
     print(f"vmcb02_cpuid_clear={'absent' if no_vmcb02_clear else 'present'}")
     print(f"nested_cpuid_leaf0_l0={'present' if nested_leaf0 else 'absent'}")
     print(f"nested_cpuid_leaf0_irqoff_fastpath={'present' if nested_leaf0_fastpath else 'absent'}")
@@ -187,9 +215,12 @@ def main() -> int:
     print(f"svm_header_sha256={sha256(SVM_HEADER)}")
     print(f"nested_source_sha256={sha256(NESTED_SOURCE)}")
     print(f"x86_source_sha256={sha256(X86_SOURCE)}")
+    print(f"cpuid_source_sha256={sha256(CPUID_SOURCE)}")
 
-    if kernel != "7.2.0-rc7-tkg-eevdf":
-        failures.append("running kernel is not 7.2.0-rc7-tkg-eevdf")
+    if not re.match(r"^7\.2\.2-tkg(?:-[A-Za-z0-9_.+-]+)?$", kernel):
+        failures.append("running kernel is not the stable 7.2.2-tkg build")
+    if source_version != "7.2.2":
+        failures.append(f"patched source tree is not Linux 7.2.2 (found {source_version})")
     if not vermagic.startswith(kernel + " "):
         failures.append("kvm_amd vermagic does not match the running kernel")
     if built_build_id == "missing":
@@ -204,6 +235,8 @@ def main() -> int:
         failures.append("kvm_amd avic parameter is disabled")
     if not gate:
         failures.append("Linux 7.2 SVME-gated CPUID source markers are missing")
+    if not amd_cpuid_signature_mask:
+        failures.append("AMD CPUID leaf 7 EDX signature mask is missing")
     if not no_vmcb02_clear:
         failures.append("nested.c directly clears VMCB02 CPUID intercept")
     if not nested_leaf0:

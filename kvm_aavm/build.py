@@ -69,6 +69,67 @@ def _validate_qemu_kvm_hypercall_hardening(qemu_source: Path) -> None:
         )
 
 
+def _validate_qemu_pci_identity(qemu_source: Path) -> None:
+    """Reject impossible Q35 PCI identities before publishing QEMU."""
+    fixed_functions = {
+        "hw/isa/lpc_ich9.c": "LPC",
+        "hw/i2c/smbus_ich9.c": "SMBus",
+        "hw/ide/ich.c": "SATA",
+        "hw/audio/intel-hda.c": "HDA",
+    }
+    for relative, name in fixed_functions.items():
+        path = qemu_source / relative
+        if not path.is_file():
+            raise AppError(f"Patched QEMU {name} source is missing: {path}")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if not re.search(r"(?:k|pc)->vendor_id\s*=\s*0x8086\s*;", text):
+            raise AppError(
+                f"Patched QEMU {name} must retain Intel vendor 8086 in its fixed Q35 slot."
+            )
+        if re.search(r"(?:k|pc)->vendor_id\s*=\s*0x1022\s*;", text):
+            raise AppError(
+                f"Patched QEMU {name} has an AMD vendor in a fixed Intel Q35 slot."
+            )
+
+    q35 = qemu_source / "hw/pci-host/q35.c"
+    if not q35.is_file():
+        raise AppError(f"Patched QEMU Q35 host bridge source is missing: {q35}")
+    q35_text = q35.read_text(encoding="utf-8", errors="replace")
+    if not re.search(r"k->vendor_id\s*=\s*PCI_VENDOR_ID_INTEL\s*;", q35_text):
+        raise AppError("Patched QEMU Q35 host bridge no longer uses Intel vendor 8086.")
+
+    pci_ids = qemu_source / "include/hw/pci/pci_ids.h"
+    if not pci_ids.is_file():
+        raise AppError(f"Patched QEMU PCI IDs header is missing: {pci_ids}")
+    ids_text = pci_ids.read_text(encoding="utf-8", errors="replace")
+    match = re.search(
+        r"#define\s+PCI_DEVICE_ID_INTEL_P35_MCH\s+0x([0-9a-fA-F]+)", ids_text,
+    )
+    if not match:
+        raise AppError("Patched QEMU Q35 host bridge device ID is missing.")
+    # These are AMD northbridge IDs used by host inventory. They are invalid
+    # when paired with q35.c's Intel vendor ID.
+    if match.group(1).lower() in {"1450", "14d8", "14e0", "15d0", "1630"}:
+        raise AppError(
+            "Patched QEMU pairs Intel Q35 host-bridge vendor 8086 with an AMD device ID."
+        )
+
+    pci_header = qemu_source / "include/hw/pci/pci.h"
+    if not pci_header.is_file():
+        raise AppError(f"Patched QEMU PCI header is missing: {pci_header}")
+    header_text = pci_header.read_text(encoding="utf-8", errors="replace")
+    values = {}
+    for name in ("PCI_VENDOR_ID_REDHAT_QUMRANET", "PCI_SUBVENDOR_ID_REDHAT_QUMRANET"):
+        found = re.search(rf"#define\s+{name}\s+0x([0-9a-fA-F]+)", header_text)
+        if not found:
+            raise AppError(f"Patched QEMU PCI header is missing {name}.")
+        values[name] = found.group(1).lower()
+    if values["PCI_VENDOR_ID_REDHAT_QUMRANET"] == "1af4":
+        raise AppError("Patched QEMU still exposes the Qumranet virtual vendor fallback.")
+    if values["PCI_VENDOR_ID_REDHAT_QUMRANET"] != values["PCI_SUBVENDOR_ID_REDHAT_QUMRANET"]:
+        raise AppError("Patched QEMU virtio vendor and subsystem vendor IDs do not match.")
+
+
 def _validate_ovmf_firmware_identity(
     ovmf_source: Path, expected_firmware: dict[str, str] | None = None,
 ) -> None:
@@ -319,6 +380,7 @@ def build_all(
     _validate_generated_vars(work / "vars.sh")
     _validate_qemu_firmware_hardening(work / "qemu")
     _validate_qemu_kvm_hypercall_hardening(work / "qemu")
+    _validate_qemu_pci_identity(work / "qemu")
     runner.run(["bash", "ovmfpatch.sh"], cwd=work, env=env)
     _validate_ovmf_firmware_identity(work / "ovmf", profile.get("identity_firmware"))
     _validate_ovmf_measured_boot(work / "ovmf")

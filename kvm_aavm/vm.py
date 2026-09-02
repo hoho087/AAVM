@@ -76,6 +76,7 @@ def new_profile(
             "disk_gib": disk_gib, "memory_gib": memory_gib, "vcpus": vcpus,
             "hugepages_2m": False,
             "threads_per_core": cpu_layout["threads_per_core"],
+            "cpuid_policy": "intercepted",
             "cpu_pinning": {
                 "vcpus": cpu_layout["vcpu_pins"],
                 "emulator": cpu_layout["emulator_cpus"],
@@ -924,13 +925,7 @@ def configure_cpu_layout(name: str, vcpus: int, runner: Runner) -> dict:
             raise AppError("Automatic CPU topology is available only for deployer-owned VMs.")
         current_host = host_fingerprint()
         resources = profile.setdefault("resources", {})
-        cpuid_policy = resources.get("cpuid_policy", "intercepted")
-        layout = vm_cpu_layout(
-            current_host["cpu"], vcpus,
-            shared_emulator_cores=(
-                2 if cpuid_policy == "svme-gated-native" else 0
-            ),
-        )
+        layout = vm_cpu_layout(current_host["cpu"], vcpus)
         if not layout["vcpu_pins"] or not layout["emulator_cpus"]:
             raise AppError(
                 "The requested vCPU count leaves no complete physical core for Ubuntu; "
@@ -1053,6 +1048,13 @@ def enable_devirtualized(
     with vm_lock(name):
         profile = load_profile(name)
         _refresh_profile_host_capabilities(profile)
+        resources = profile.setdefault("resources", {})
+        # Older profiles may contain the withdrawn native policy.  Migrate it
+        # before generating XML so KVM always owns the guest-visible CPUID.
+        if resources.get("cpuid_policy") == "svme-gated-native":
+            resources["cpuid_policy"] = "intercepted"
+        else:
+            resources.setdefault("cpuid_policy", "intercepted")
         profile["guest_vtd"] = bool(guest_vtd) if guest_vtd is not None else bool(
             profile.get("guest_vtd", False)
         )

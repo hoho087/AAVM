@@ -438,8 +438,17 @@ def device_identity(devices: list[PciDevice], cpu_vendor: str) -> dict[str, str]
     # Return the first matching real PCI device.  If the host does not expose
     # a device of that class, fall back to the legacy/default device ID instead
     # of returning None (which later crashes build.py on value.upper()).
-    def first(classes: set[str], default: str) -> PciDevice | str:
-        return next((d for d in relevant if d.class_code in classes), default)
+    def first(
+        classes: set[str], default: str, *, avoid_device_ids: set[str] | None = None,
+    ) -> PciDevice | str:
+        avoid = avoid_device_ids or set()
+        return next(
+            (
+                d for d in relevant
+                if d.class_code in classes and d.device_id not in avoid
+            ),
+            default,
+        )
 
     # Every fallback is a real, publicly assigned chipset device ID.  Do not
     # use QEMU/Red Hat/Bochs IDs or generated numbers here: these values become
@@ -468,15 +477,22 @@ def device_identity(devices: list[PciDevice], cpu_vendor: str) -> dict[str, str]
         },
     }["amd" if cpu_vendor == "amd" else "intel"]
 
+    rootport = first({"0604"}, defaults["rootport"])
+    bridge_ids = {rootport.device_id} if isinstance(rootport, PciDevice) else set()
     mapping = {
         "lpc": first({"0601"}, defaults["lpc"]),
         "smbus": first({"0c05"}, defaults["smbus"]),
         "audio": first({"0401", "0403"}, defaults["audio"]),
         "storage": first({"0106", "0108"}, defaults["storage"]),
-        "rootport": first({"0604"}, defaults["rootport"]),
+        "rootport": rootport,
         "xhci": first({"0c03"}, defaults["xhci"]),
         "hostbridge": first({"0600"}, defaults["hostbridge"]),
-        "pcibridge": first({"0604"}, defaults["pcibridge"]),
+        # QEMU exposes both a root port and a downstream PCI bridge.  Do not
+        # assign one host bridge identity to both roles when the inventory has
+        # more than one candidate; duplicate IDs are needlessly conspicuous.
+        "pcibridge": first(
+            {"0604"}, defaults["pcibridge"], avoid_device_ids=bridge_ids,
+        ),
     }
 
     output = {

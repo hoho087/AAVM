@@ -21,6 +21,7 @@ from kvm_aavm.build import (
     _validate_ovmf_measured_boot,
     _validate_qemu_firmware_hardening,
     _validate_qemu_kvm_hypercall_hardening,
+    _validate_qemu_pci_identity,
 )
 from kvm_aavm.hardware import (
     PciDevice, device_identity, kvm_capabilities, parse_usb_line, vm_cpu_layout,
@@ -29,6 +30,7 @@ from kvm_aavm.host import _managed_kvm_module_config, _replace_grub_args, _set_n
 from kvm_aavm.identity import apply_board_identity, generate, mac_address, rerandomize
 from kvm_aavm.util import AppError
 from kvm_aavm.vm import _ensure_disk, _ensure_install_ovmf_code, _stage_install_media
+from kvm_aavm.vm import new_profile
 from kvm_aavm.xmlgen import (
     AAVM_NS, INSTALL_MACHINE_TYPE, INSTALL_OVMF_CODE, INSTALL_OVMF_VARS, INSTALL_QEMU,
     build_domain_xml, update_artifact_paths, update_identity,
@@ -101,6 +103,23 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(rotated["identity"]["baseboard_product"], board["product"])
         self.assertEqual(rotated["identity"]["version"], board["version"])
 
+    def test_new_amd_profile_defaults_to_intercepted_cpuid(self):
+        host = {
+            "cpu": {
+                "vendor": "amd", "model": "AMD Test CPU", "virtualization": "svm",
+                "threads_per_core": 2, "thread_siblings": [[0, 8], [1, 9], [2, 10]],
+                "native_apic_ids": {
+                    "0": 0, "8": 1, "1": 2, "9": 3, "2": 4, "10": 5,
+                },
+            },
+        }
+        with patch("kvm_aavm.vm.host_fingerprint", return_value=host), \
+             patch("kvm_aavm.vm.vm_dir", return_value=Path("/tmp/test-vm")):
+            value = new_profile("test-vm", 100, 8, 4, "/iso/windows.iso", 1000)
+        self.assertEqual(value["resources"]["cpuid_policy"], "intercepted")
+        self.assertEqual(value["resources"]["cpu_pinning"]["vcpus"], [0, 8, 1, 9])
+        self.assertEqual(value["resources"]["cpu_pinning"]["emulator"], [2, 10])
+
 
 class HardwareTests(unittest.TestCase):
     def test_device_identity_uses_real_class_matched_bridge_fallbacks(self):
@@ -109,13 +128,22 @@ class HardwareTests(unittest.TestCase):
         )
         identity = device_identity([memory_controller], "amd")
         self.assertEqual(identity["pcibridge"], "1633")
+        self.assertEqual(identity["rootport"], "1448")
         self.assertEqual(identity["xhci"], "7914")
 
         bridge = PciDevice(
             "00:01.1", "0604", "1022", "14db", "PCIe GPP Bridge",
         )
         identity = device_identity([memory_controller, bridge], "amd")
-        self.assertEqual(identity["pcibridge"], "14db")
+        self.assertEqual(identity["rootport"], "14db")
+        self.assertEqual(identity["pcibridge"], "1633")
+
+        second_bridge = PciDevice(
+            "00:01.2", "0604", "1022", "14dc", "PCIe GPP Bridge",
+        )
+        identity = device_identity([memory_controller, bridge, second_bridge], "amd")
+        self.assertEqual(identity["rootport"], "14db")
+        self.assertEqual(identity["pcibridge"], "14dc")
 
     def test_older_amd_capabilities_do_not_require_missing_accelerators(self):
         cpu = {
@@ -246,34 +274,26 @@ class XmlTests(unittest.TestCase):
         self.assertEqual(pins[1].attrib, {"vcpu": "1", "cpuset": "10"})
         self.assertEqual(root.find("./cputune/emulatorpin").get("cpuset"), "0,1,8,9")
 
-    def test_svme_gated_native_cpuid_accepts_contiguous_native_apic_subset(self):
+    def test_legacy_native_cpuid_policy_is_rendered_as_intercepted(self):
         value = profile()
-        value["host"]["cpu"].update({
-            "logical_cpus": 4,
-            "native_apic_ids": {"0": 0, "2": 1, "1": 2, "3": 3},
-        })
         value["resources"].update({
             "vcpus": 4,
             "threads_per_core": 2,
             "cpuid_policy": "svme-gated-native",
             "cpu_pinning": {
-                "vcpus": [0, 2, 1, 3],
-                "emulator": [1, 3],
+                "vcpus": [3, 2, 1, 0],
+                "emulator": [4, 5],
             },
         })
         root = ET.fromstring(build_domain_xml(value, stage="final"))
         stage = root.find(f"./metadata/{{{AAVM_NS}}}stage")
-        self.assertEqual(stage.get("cpuid-policy"), "svme-gated-native")
+        self.assertEqual(stage.get("cpuid-policy"), "intercepted")
         self.assertEqual(root.findtext("./vcpu"), "4")
-        value["resources"]["vcpus"] = 2
-        value["resources"]["cpu_pinning"] = {
-            "vcpus": [0, 2],
-            "emulator": [1, 3],
-        }
-        subset = ET.fromstring(build_domain_xml(value, stage="final"))
-        self.assertEqual(subset.findtext("./vcpu"), "2")
-        value["resources"]["cpu_pinning"]["vcpus"] = [0, 1]
-        with self.assertRaisesRegex(AppError, "same native APIC ID"):
+
+    def test_unknown_cpuid_policy_is_rejected(self):
+        value = profile()
+        value["resources"]["cpuid_policy"] = "host-raw"
+        with self.assertRaisesRegex(AppError, "Unsupported CPUID policy"):
             build_domain_xml(value, stage="final")
 
     def test_required_vtd_xml_is_delayed_until_patched_stage(self):
@@ -1099,6 +1119,68 @@ class BuildTests(unittest.TestCase):
             with self.assertRaisesRegex(AppError, "hypercall"):
                 _validate_qemu_kvm_hypercall_hardening(qemu)
 
+    def test_qemu_pci_identity_rejects_impossible_q35_pairs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            qemu = Path(temporary) / "qemu"
+            for relative in (
+                "hw/isa/lpc_ich9.c", "hw/i2c/smbus_ich9.c",
+                "hw/ide/ich.c", "hw/audio/intel-hda.c",
+            ):
+                path = qemu / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("k->vendor_id = 0x8086;\n", encoding="utf-8")
+            q35 = qemu / "hw/pci-host/q35.c"
+            q35.parent.mkdir(parents=True, exist_ok=True)
+            q35.write_text("k->vendor_id = PCI_VENDOR_ID_INTEL;\n", encoding="utf-8")
+            ids = qemu / "include/hw/pci/pci_ids.h"
+            ids.parent.mkdir(parents=True, exist_ok=True)
+            ids.write_text(
+                "#define PCI_DEVICE_ID_INTEL_P35_MCH      0x9b54\n",
+                encoding="utf-8",
+            )
+            header = qemu / "include/hw/pci/pci.h"
+            header.write_text(
+                "#define PCI_VENDOR_ID_REDHAT_QUMRANET    0x1022\n"
+                "#define PCI_SUBVENDOR_ID_REDHAT_QUMRANET 0x1022\n",
+                encoding="utf-8",
+            )
+            _validate_qemu_pci_identity(qemu)
+
+            ids.write_text(
+                "#define PCI_DEVICE_ID_INTEL_P35_MCH      0x14d8\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AppError, "host-bridge"):
+                _validate_qemu_pci_identity(qemu)
+
+    def test_qemu_pci_identity_rejects_mismatched_subsystem_vendor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            qemu = Path(temporary) / "qemu"
+            for relative in (
+                "hw/isa/lpc_ich9.c", "hw/i2c/smbus_ich9.c",
+                "hw/ide/ich.c", "hw/audio/intel-hda.c",
+            ):
+                path = qemu / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("k->vendor_id = 0x8086;\n", encoding="utf-8")
+            q35 = qemu / "hw/pci-host/q35.c"
+            q35.parent.mkdir(parents=True, exist_ok=True)
+            q35.write_text("k->vendor_id = PCI_VENDOR_ID_INTEL;\n", encoding="utf-8")
+            ids = qemu / "include/hw/pci/pci_ids.h"
+            ids.parent.mkdir(parents=True, exist_ok=True)
+            ids.write_text(
+                "#define PCI_DEVICE_ID_INTEL_P35_MCH      0x9b54\n",
+                encoding="utf-8",
+            )
+            header = qemu / "include/hw/pci/pci.h"
+            header.write_text(
+                "#define PCI_VENDOR_ID_REDHAT_QUMRANET    0x1022\n"
+                "#define PCI_SUBVENDOR_ID_REDHAT_QUMRANET 0x8086\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AppError, "subsystem vendor"):
+                _validate_qemu_pci_identity(qemu)
+
     def test_q35_dmar_ioapic_uses_root_bus_requester_id(self):
         source = (Path(__file__).parents[1] / "qemupatch.sh").read_text(encoding="utf-8")
         self.assertIn("Q35_PSEUDO_BUS_PLATFORM         (0x00)", source)
@@ -1165,28 +1247,57 @@ class BuildTests(unittest.TestCase):
             's/PCIE_BRIDGE 0x000e/PCIE_BRIDGE 0x$pcibridge_1022/', source,
         )
         self.assertIn(
-            'PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_1022/', source,
+            'PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_8086/', source,
         )
         self.assertIn(
-            'edk2bridge_1022=\\"$hostbridge_1022\\"', source,
+            'edk2bridge_1022=\\"$hostbridge_8086\\"', source,
+        )
+        # Q35's integrated LPC/SMBus/SATA functions are fixed at PCI 1F.0,
+        # 1F.3 and 1F.2.  Keep their real Intel vendor IDs on AMD hosts so
+        # the generated ACPI topology is internally consistent.
+        self.assertIn('s/PCI_VENDOR_ID_INTEL;/0x8086;/', source)
+        self.assertIn(
+            's/PCI_DEVICE_ID_INTEL_ICH9_8;/0x$lpc_8086;/', source,
+        )
+        self.assertIn(
+            's/PCI_DEVICE_ID_INTEL_ICH9_6;/0x$smbus_8086;/', source,
+        )
+        self.assertIn(
+            's/PCI_DEVICE_ID_INTEL_82801IR;/0x$sata_8086;/', source,
+        )
+        # ICH9 HDA is the fixed Q35 00:1B.0 function as well; AMD hosts must
+        # not receive an AMD VEN_1022 identity in that Intel slot.
+        self.assertIn(
+            's/PCI_VENDOR_ID_INTEL;/0x8086;/', source,
+        )
+        self.assertIn(
+            's/0x293e;/0x$hdaudio_8086;/', source,
+        )
+        self.assertNotIn(
+            's/PCI_VENDOR_ID_INTEL;/0x1022;/', source,
+        )
+        self.assertNotIn(
+            's/0x293e;/0x$hdaudio_1022;/', source,
         )
         ovmf = (Path(__file__).parents[1] / "ovmfpatch.sh").read_text(
             encoding="utf-8",
         )
         self.assertNotIn("cpu_vendor:1", ovmf)
         self.assertIn('if [[ "$cpu_vendor" == "AuthenticAMD" ]]', ovmf)
+        self.assertIn('$edk2bridge_8086', ovmf)
+        self.assertNotIn('$edk2bridge_1022', ovmf)
 
     def test_hardware_name_is_shell_safe_and_sed_escaped_at_runtime(self):
         hardware = {
-            "cpu_vendor": "amd", "lpc": "1111", "smbus": "2222",
+            "cpu_vendor": "intel", "lpc": "1111", "smbus": "2222",
             "audio": "3333", "audio_name": "Family 17h/19h A&B | $USER $(id)",
             "storage": "4444", "rootport": "5555", "xhci": "6666",
             "hostbridge": "7777", "pcibridge": "8888",
         }
         source = (Path(__file__).parents[1] / "qemupatch.sh").read_text(encoding="utf-8")
         adapted = _adapt_qemu_script(source, Path("/tmp/output"), hardware)
-        self.assertIn("hdaname_1022='Family 17h/19h A&B | $USER $(id)'", adapted)
-        self.assertIn('escape_sed_replacement "$hdaname_1022"', adapted)
+        self.assertIn("hdaname_8086='Family 17h/19h A&B | $USER $(id)'", adapted)
+        self.assertIn('escape_sed_replacement "$hdaname_8086"', adapted)
 
 
 class PassthroughTests(unittest.TestCase):
@@ -2302,6 +2413,8 @@ class KernelTests(unittest.TestCase):
         self.assertNotIn("nested.save.cpl == 3", text)
         self.assertNotIn("vmcb_clr_intercept(&vmcb02->control, INTERCEPT_CPUID)", text)
         self.assertNotIn("nested_vmcb02", text)
+        self.assertNotIn("native_cpuid", text)
+        self.assertNotIn("guest_cpu_cap_has(vcpu, X86_FEATURE_SVM)", text)
         self.assertIn("if (svme)", text)
         self.assertIn("if (is_guest_mode(vcpu))", text)
         self.assertIn("svm->vmcb01.ptr->save.efer & EFER_SVME", text)
@@ -2337,6 +2450,21 @@ class KernelTests(unittest.TestCase):
         self.assertNotIn("npf_cache[4]", text)
         self.assertIn("struct kvm_host_map vmcb12_map;", text)
         self.assertIn("svm->nested.vmcb12_map_generation != generation", text)
+        self.assertIn("AMD/Hygon reserve the Intel mitigation bits in CPUID.7.0.EDX.", text)
+        self.assertIn("*edx &= ~(BIT(26) | BIT(27) | BIT(31));", text)
+
+    def test_amd_cpuid_validation_rejects_missing_leaf7_signature_mask(self):
+        project = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_file = Path(temporary) / "amd-test.mypatch"
+            text = (project / "amd72-test.mypatch").read_text(encoding="utf-8")
+            text = text.replace(
+                "*edx &= ~(BIT(26) | BIT(27) | BIT(31));",
+                "*edx &= ~BIT(26);",
+            )
+            patch_file.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(AppError, "CPUID leaf 7 EDX"):
+                kernel._validate_amd_cpuid_virtualization_patch(patch_file)
 
     def test_amd_cpuid_validation_rejects_missing_nested_db_direct_reflection(self):
         project = Path(__file__).parents[1]
@@ -2433,6 +2561,10 @@ class KernelTests(unittest.TestCase):
         )
         self.assertIn(
             "nested_cpuid_leaf0_short_reentry=",
+            verifier.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "amd_cpuid_leaf7_signature_mask=",
             verifier.read_text(encoding="utf-8"),
         )
         profiler_source = profiler.read_text(encoding="utf-8")

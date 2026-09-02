@@ -151,8 +151,13 @@ CPUID 快速路徑的安全邊界如下：
 
 - AMD SVM 只有全域 `INTERCEPT_CPUID`，沒有 per-leaf bitmap；不能粗暴清除 nested VMCB02
   intercept，否則會繞過 Hyper-V 對其他 leaf 的 ownership，可能讓 Windows 卡死。
-- 韌體和一般 Windows 開機仍使用 KVM CPUID 模型；guest 寫入 `EFER.SVME` 後才考慮清除
-  VMCB01 的 CPUID intercept。
+- 韌體、一般 Windows 開機及隱藏 guest SVM/VMX 的 VM 一律使用 KVM CPUID 模型；隱藏 SVM
+  不代表可安全回傳主機 CPUID，否則會洩漏主機拓撲與客體未宣告的功能。只有 nested L1 寫入
+  `EFER.SVME` 後，VMCB01 才可依既有 L0/L1 ownership 規則解除 intercept。
+- 先前的 `svme-gated-native` profile 會在下一次套用去虛擬化設定時遷移為
+  `resources.cpuid_policy=intercepted`；XML 產生期間也會以 intercepted 相容處理舊 profile。
+- AMD-compatible guest 的 `CPUID.7.0.EDX` 清除 Intel 專用的 `SPEC_CTRL`、`STIBP` 與
+  `SSBD` bits；AMD 原生 mitigation enumeration 保留在 `0x80000008.EBX`。
 - 只對受控的 leaf 0 快取結果，並在 IRQ-off、無 pending event/request、PMU/TLB/ERAP 狀態
   安全且有 NRIPS 時直接重入 L2；其他 leaf、CPUID faulting、SEV-ES 或不符合 guard 的情況
   全部回到完整上游 handler。

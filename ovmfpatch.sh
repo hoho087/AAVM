@@ -437,8 +437,10 @@ sed -i "$file_AuthServiceInternal" -Ee "s/L\"certdbv\"/L\"dbv${prefix}${suffix}\
 
 echo "  $file_Q35MchIch9"
 if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
-  echo "INTEL_Q35_MCH_DEVICE_ID  0x29C0                   -> INTEL_Q35_MCH_DEVICE_ID  0x$edk2bridge_1022"
-  sed -i "$file_Q35MchIch9" -Ee "s/INTEL_Q35_MCH_DEVICE_ID  0x29C0/INTEL_Q35_MCH_DEVICE_ID  0x$edk2bridge_1022/"
+  # Q35's host bridge remains Intel even when the host CPU is AMD. Keep the
+  # firmware's device ID in sync with qemu's 8086 vendor identity.
+  echo "INTEL_Q35_MCH_DEVICE_ID  0x29C0                   -> INTEL_Q35_MCH_DEVICE_ID  0x$edk2bridge_8086"
+  sed -i "$file_Q35MchIch9" -Ee "s/INTEL_Q35_MCH_DEVICE_ID  0x29C0/INTEL_Q35_MCH_DEVICE_ID  0x$edk2bridge_8086/"
 else
   echo "INTEL_Q35_MCH_DEVICE_ID  0x29C0                   -> INTEL_Q35_MCH_DEVICE_ID  0x$edk2bridge_8086"
   sed -i "$file_Q35MchIch9" -Ee "s/INTEL_Q35_MCH_DEVICE_ID  0x29C0/INTEL_Q35_MCH_DEVICE_ID  0x$edk2bridge_8086/"

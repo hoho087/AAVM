@@ -595,6 +595,23 @@ diff -urN a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
  EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_mmio);
  EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_fast_mmio);
  EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_inj_virq);
+diff -urN a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+--- a/arch/x86/kvm/cpuid.c	2026-08-31 23:52:59.538391320 +0800
++++ b/arch/x86/kvm/cpuid.c	2026-09-02 00:00:00.000000000 +0800
+@@ -2154,2 +2154,11 @@
+-	trace_kvm_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
+-			used_max_basic);
++	/*
++	 * AMD/Hygon reserve the Intel mitigation bits in CPUID.7.0.EDX.
++	 * KVM's host capability aliases may otherwise leak SPEC_CTRL, STIBP,
++	 * and SSBD into an AMD-compatible guest, which is both architecturally
++	 * wrong and visible to timing/signature detectors.  Keep AMD's native
++	 * mitigation enumeration in 0x80000008.EBX unchanged.
++	 */
++	if (function == 7 && index == 0 && vcpu->arch.is_amd_compatible)
++		*edx &= ~(BIT(26) | BIT(27) | BIT(31));
++	trace_kvm_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
++			used_max_basic);
 diff -urN a/include/linux/kvm_host.h b/include/linux/kvm_host.h
 --- a/include/linux/kvm_host.h	2026-08-31 23:52:59.540581977 +0800
 +++ b/include/linux/kvm_host.h	2026-08-31 23:52:59.543413020 +0800

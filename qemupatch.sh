@@ -48,7 +48,10 @@ if [[ ! -f vars.sh ]]; then
   echo "virtio=\"$virtio\""                  >> vars.sh
   # OVMF's Q35 MCH constant represents the host/DRAM bridge (class 0600),
   # not a downstream PCIe bridge (class 0604).
-  echo "edk2bridge_1022=\"$hostbridge_1022\"" >> vars.sh
+  # Q35's host bridge is an Intel device in the guest topology. Keep the
+  # legacy 1022-named variable as an alias so older OVMF helpers cannot pair
+  # an Intel vendor with an AMD device ID.
+  echo "edk2bridge_1022=\"$hostbridge_8086\"" >> vars.sh
   echo "edk2bridge_8086=\"$hostbridge_8086\"" >> vars.sh
 else
   echo -e "$(pwd)/\e[1mvars.sh\e[0m found."
@@ -58,7 +61,7 @@ else
   echo "xhci=\"$xhci\""                      >> vars.sh
   echo "cpu=\"$cpu\""                        >> vars.sh
   echo "virtio=\"$virtio\""                  >> vars.sh
-  echo "edk2bridge_1022=\"$hostbridge_1022\"" >> vars.sh
+  echo "edk2bridge_1022=\"$hostbridge_8086\"" >> vars.sh
   echo "edk2bridge_8086=\"$hostbridge_8086\"" >> vars.sh
 fi
 
@@ -855,11 +858,16 @@ echo ".SF8.                                             -> .LPCB."
 echo "ICH9 LPC bridge                                   -> LPC Bridge"
 sed -i "$file_lpcich9" -Ee "s/.SF8./.LPCB./"
 sed -i "$file_lpcich9" -Ee "s/ICH9 LPC bridge/LPC Bridge/"
+# Q35 hard-wires LPC/SMBus/SATA to PCI 1F:0/2/3.  Keep those integrated
+# functions as genuine Intel Q35 devices even on an AMD host: assigning
+# VEN_1022 to these fixed Intel slots is an impossible topology (and is
+# explicitly rejected by current ACPI virtualisation checks).  AMD identity
+# remains available for the host bridge, root ports and endpoint devices.
 if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x1022;"
-  echo "PCI_DEVICE_ID_INTEL_ICH9_8;                       -> 0x790E;  // FCH LPC Bridge"
-  sed -i "$file_lpcich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x1022;/"
-  sed -i "$file_lpcich9" -Ee "s/PCI_DEVICE_ID_INTEL_ICH9_8;/0x$lpc_1022;/"
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;  // fixed Q35 LPC slot"
+  echo "PCI_DEVICE_ID_INTEL_ICH9_8;                       -> 0x$lpc_8086;  // real Intel LPC ID"
+  sed -i "$file_lpcich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x8086;/"
+  sed -i "$file_lpcich9" -Ee "s/PCI_DEVICE_ID_INTEL_ICH9_8;/0x$lpc_8086;/"
 else
   echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;"
   echo "PCI_DEVICE_ID_INTEL_ICH9_8;                       -> 0x068D;  // Comet Lake LPC Controller"
@@ -869,10 +877,10 @@ fi
 
 echo "  $file_smbusich9"
 if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x1022;"
-  echo "PCI_DEVICE_ID_INTEL_ICH9_6;                       -> 0x790B;  // FCH SMBus Controller"
-  sed -i "$file_smbusich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x1022;/"
-  sed -i "$file_smbusich9" -Ee "s/PCI_DEVICE_ID_INTEL_ICH9_6;/0x$smbus_1022;/"
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;  // fixed Q35 SMBus slot"
+  echo "PCI_DEVICE_ID_INTEL_ICH9_6;                       -> 0x$smbus_8086;  // real Intel SMBus ID"
+  sed -i "$file_smbusich9" -Ee "s/PCI_VENDOR_ID_INTEL;/0x8086;/"
+  sed -i "$file_smbusich9" -Ee "s/PCI_DEVICE_ID_INTEL_ICH9_6;/0x$smbus_8086;/"
 else
   echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;"
   echo "PCI_DEVICE_ID_INTEL_ICH9_6;                       -> 0xA3A3;  // Comet Lake PCH-V SMBus Host Controller"
@@ -884,12 +892,16 @@ sed -i "$file_smbusich9" -Ee "s/ICH9 SMBUS Bridge/SMBus Bridge/"
 
 echo "  $file_intelhda"
 if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
-  hdaname_sed=$(escape_sed_replacement "$hdaname_1022")
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x1022;"
-  echo "0x293e;                                           -> 0x$hdaudio_1022;  // $hdaname_1022"
-  echo "Intel HD Audio Controller (ich9)                  -> $hdaname_1022"
-  sed -i "$file_intelhda" -Ee "s/PCI_VENDOR_ID_INTEL;/0x1022;/"
-  sed -i "$file_intelhda" -Ee "s/0x293e;/0x$hdaudio_1022;/"
+  # ICH9 HDA is also a fixed Q35 function (00:1b.0), just like LPC,
+  # SMBus and SATA.  Do not put an AMD vendor ID in that Intel slot: modern
+  # ACPI/PCI detectors treat the combination as an impossible Q35 topology.
+  # Keep the identity a real Intel PCH HDA controller on every host vendor.
+  hdaname_sed=$(escape_sed_replacement "$hdaname_8086")
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;  // fixed Q35 HDA slot"
+  echo "0x293e;                                           -> 0x$hdaudio_8086;  // real Intel HDA ID"
+  echo "Intel HD Audio Controller (ich9)                  -> $hdaname_8086"
+  sed -i "$file_intelhda" -Ee "s/PCI_VENDOR_ID_INTEL;/0x8086;/"
+  sed -i "$file_intelhda" -Ee "s/0x293e;/0x$hdaudio_8086;/"
   sed -i "$file_intelhda" -Ee "s|Intel HD Audio Controller \(ich9\)|$hdaname_sed|"
 else
   hdaname_sed=$(escape_sed_replacement "$hdaname_8086")
@@ -950,10 +962,10 @@ sed -i "$file_core" -Ee "s/QEMU HARDDISK/$new_default_model/"
 
 echo "  $file_ich"
 if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
-  echo "PCI_VENDOR_ID_INTEL;                              -> 0x1022;"
-  echo "PCI_DEVICE_ID_INTEL_82801IR;                      -> 0x7901;  // FCH SATA Controller [AHCI mode]"
-  sed -i "$file_ich" -Ee "s/PCI_VENDOR_ID_INTEL;/0x1022;/"
-  sed -i "$file_ich" -Ee "s/PCI_DEVICE_ID_INTEL_82801IR;/0x$sata_1022;/"
+  echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;  // fixed Q35 SATA slot"
+  echo "PCI_DEVICE_ID_INTEL_82801IR;                      -> 0x$sata_8086;  // real Intel SATA ID"
+  sed -i "$file_ich" -Ee "s/PCI_VENDOR_ID_INTEL;/0x8086;/"
+  sed -i "$file_ich" -Ee "s/PCI_DEVICE_ID_INTEL_82801IR;/0x$sata_8086;/"
 else
   echo "PCI_VENDOR_ID_INTEL;                              -> 0x8086;"
   echo "PCI_DEVICE_ID_INTEL_82801IR;                      -> 0x06D2;  // Comet Lake SATA AHCI Controller"
@@ -1821,8 +1833,9 @@ else
 fi
 echo "0x1111                                            -> 0x$device"
 sed -i "$header_pci" -Ee "s/0x1111/0x$device/"
-echo "QUMRANET    0x1af4                                -> QUMRANET    0x8086"
-sed -i "$header_pci" -Ee "s/QUMRANET    0x1af4/QUMRANET    0x8086/"
+# The two QUMRANET definitions above are rewritten together with the host
+# vendor. Do not apply an unconditional Intel rewrite here: on AMD it would
+# leave virtio subsystem IDs as 8086 while their device vendor is 1022.
 echo "VIRTIO_10_BASE     0x1040                         -> VIRTIO_10_BASE     0x$( printf '%X' $((virtio - 1)) )"
 sed -i "$header_pci" -Ee "s/VIRTIO_10_BASE     0x1040/VIRTIO_10_BASE     0x$( printf '%X' $((virtio - 1)) )/"
 
@@ -1838,8 +1851,11 @@ sed -i "$file_makefile" -Ee "s/DID := 10d3/DID := 10F6/"
 
 echo "  $header_pciids"
 if [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
-  echo "PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0           -> PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_1022"
-  sed -i "$header_pciids" -Ee "s/PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0/PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_1022/"
+  # Q35 exposes an Intel host bridge at 00:00.0. The previous AMD device-ID
+  # substitution produced impossible 8086:1022/14d8 combinations and was
+  # reported by ACPI PCI topology checks.
+  echo "PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0           -> PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_8086"
+  sed -i "$header_pciids" -Ee "s/PCI_DEVICE_ID_INTEL_P35_MCH      0x29c0/PCI_DEVICE_ID_INTEL_P35_MCH      0x$hostbridge_8086/"
   echo "VMWARE             0x15ad                         -> VMWARE             0x1022"
   sed -i "$header_pciids" -Ee "s/VMWARE             0x15ad/VMWARE             0x1022/"
 else

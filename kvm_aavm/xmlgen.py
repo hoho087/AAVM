@@ -518,29 +518,12 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
     stage_metadata.set("tpm-mode", tpm_mode)
     stage_metadata.set("tpm-profile", tpm_profile or "none")
     cpuid_policy = str(resources.get("cpuid_policy", "intercepted"))
-    if cpuid_policy not in {"intercepted", "svme-gated-native"}:
-        raise AppError(f"Unsupported CPUID policy: {cpuid_policy}")
+    # Keep profiles made by the short-lived native policy bootable, but never
+    # expose raw host CPUID to a guest with a virtual CPU topology.
     if cpuid_policy == "svme-gated-native":
-        host_cpu = profile.get("host", {}).get("cpu", {})
-        vcpus = int(resources.get("vcpus", 0))
-        pins = [
-            int(cpu) for cpu in resources.get("cpu_pinning", {}).get("vcpus", [])
-        ]
-        native_apic_ids = {
-            int(cpu): int(apic_id)
-            for cpu, apic_id in host_cpu.get("native_apic_ids", {}).items()
-        }
-        if (
-            host_cpu.get("vendor") != "amd"
-            or vcpus <= 0
-            or len(pins) != vcpus
-            or len(set(pins)) != vcpus
-            or any(native_apic_ids.get(cpu) != vcpu for vcpu, cpu in enumerate(pins))
-        ):
-            raise AppError(
-                "SVME-gated native CPUID requires each guest vCPU to be uniquely "
-                "pinned to the AMD host logical CPU with the same native APIC ID."
-            )
+        cpuid_policy = "intercepted"
+    if cpuid_policy != "intercepted":
+        raise AppError(f"Unsupported CPUID policy: {cpuid_policy}")
     stage_metadata.set("cpuid-policy", cpuid_policy)
     if physical_gpu_display:
         # libvirt preserves only one top-level element per custom metadata
@@ -637,8 +620,10 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
     _sub(cpu, "feature", policy="disable", name="hypervisor")
     virtualization = host_cpu.get("virtualization")
     if virtualization:
-        # Host nested support is prepared globally. Only an explicitly opted-in
-        # Core Isolation/VBS guest sees SVM/VMX; all other guests keep it hidden.
+        # Keep SVM/VMX hidden unless the guest explicitly uses Core
+        # Isolation/VBS.  KVM must still virtualize CPUID while it is hidden;
+        # nested Hyper-V opts into the guarded VMCB01 fastpath through
+        # EFER.SVME.
         _sub(
             cpu, "feature",
             policy="require" if guest_core_isolation_active else "disable",

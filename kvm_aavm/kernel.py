@@ -197,6 +197,10 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
         line[1:] for line in lines
         if line.startswith("+") and not line.startswith("+++")
     )
+    patch_context = "\n".join(
+        line[1:] for line in lines
+        if line.startswith(("+", " ")) and not line.startswith("+++")
+    )
     recalc_gated = re.findall(
         r"if \(svme\)\s*\n"
         r"\s*svm_clr_intercept\(svm, INTERCEPT_CPUID\);\s*\n"
@@ -260,6 +264,15 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
         "kvm_clear_available_registers(vcpu, SVM_REGS_LAZY_LOAD_SET)",
         "aavm_nested_cpuid0_finish_full_tail:",
     ))
+    amd_cpuid_signature_mask = (
+        "AMD/Hygon reserve the Intel mitigation bits in CPUID.7.0.EDX." in patch_context
+        and re.search(
+            r"if \(function == 7 && index == 0 && vcpu->arch\.is_amd_compatible\)\s*"
+            r"\n\s*\*edx &= ~\(BIT\(26\) \| BIT\(27\) \| BIT\(31\)\);"
+            r"[\s\S]{0,300}?trace_kvm_cpuid\(orig_function, index, \*eax, \*ebx, \*ecx, \*edx, exact,",
+            patch_context,
+        ) is not None
+    )
     nested_db_direct_reflection = re.findall(
         r"exit_code == SVM_EXIT_EXCP_BASE \+ DB_VECTOR"
         r"[\s\S]{0,500}?vmcb12_is_intercept\(&svm->nested\.ctl, exit_code\)"
@@ -281,7 +294,9 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
     ))
     problems = []
     if len(recalc_gated) != 1 or len(init_gated) != 1:
-        problems.append("必須在 recalc 與 init_vmcb 都以 EFER.SVME 控制 VMCB01 CPUID intercept")
+        problems.append(
+            "必須在 recalc 與 init_vmcb 僅以 L1 EFER.SVME 控制 VMCB01 CPUID intercept"
+        )
     if len(nested_l1_efer) != 1:
         problems.append("nested active 時必須使用 VMCB01 保存的 L1 EFER.SVME")
     if len(nested_leaf0) != 1:
@@ -296,6 +311,8 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
         problems.append("nested leaf 0 必須以 TF/PMU guard 直接提交 NRIPS 與 interrupt-shadow")
     if not nested_leaf0_deferred_tail:
         problems.append("必須保留事件/PMU/TLB guard 與完整狀態回存的 leaf-0 deferred exit-tail")
+    if not amd_cpuid_signature_mask:
+        problems.append("AMD guest 的 CPUID leaf 7 EDX 必須清除 Intel mitigation bits 26/27/31")
     if len(nested_db_direct_reflection) != 1:
         problems.append("必須保留 debugger/NMI fallback 的 nested #DB 同輪直接反射")
     if nested_npf_value_cache:
@@ -307,6 +324,11 @@ def _validate_amd_cpuid_virtualization_patch(patch: Path) -> None:
         problems.append("必須匯出並保留 kvm_cpuid tracepoint，以驗證 fastpath 實際命中")
     if len(added_cpuid) != 4:
         problems.append("CPUID intercept 變更數量不符 Linux 7.2 policy")
+    if re.search(
+        r"\bnative_cpuid\b|guest_cpu_cap_has\(vcpu, X86_FEATURE_SVM\)",
+        added_text,
+    ):
+        problems.append("不得因 guest 隱藏 SVM 而讓 VMCB01 原生執行 CPUID")
     if re.search(
         r"(?:vmcb02|nested_vmcb02|nested\.save\.cpl|save\.cpl).*"
         r"(?:INTERCEPT_CPUID|CPUID)",
