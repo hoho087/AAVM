@@ -215,6 +215,20 @@ def recover_single_gpu(vm_name: str, devices: list[PciDevice], runner: Runner) -
             f"NVIDIA is still loaded after {addresses} was detached. Its kernel state may be stale; "
             "driver_override was cleared, but a reboot is required before starting the VM again."
         )
+    expected_drivers = [_driver_module(device) for device in devices]
+    display_active = runner.run(
+        ["systemctl", "is-active", "--quiet", "display-manager.service"], check=False,
+    )
+    if (
+        all(driver is not None for driver in expected_drivers)
+        and getattr(display_active, "returncode", 1) == 0
+        and all(
+            _bound_driver(PCI_DEVICES_ROOT / f"0000:{device.address}") == expected
+            for device, expected in zip(devices, expected_drivers)
+        )
+    ):
+        print(f"{name}: host GPU and display manager already healthy; skipping GPU reclaim.")
+        return
     runner.run(["systemctl", "stop", "display-manager.service"], check=False)
     runner.run(["systemctl", "stop", "nvidia-persistenced.service"], check=False)
     errors: list[str] = []
@@ -499,6 +513,23 @@ reactivate_graphical_seat() {{
   done
   runuser -u "$user" -- env DISPLAY=:0 XAUTHORITY="$auth" xset dpms force on 2>/dev/null || true
 }}
+drain_gpu_clients() {{
+  local attempt
+  # GDM/session processes can survive terminate-seat and keep NVIDIA device
+  # nodes busy.  Wait first, then terminate stragglers; reserve KILL for the
+  # bounded final step so an unresponsive client cannot hang PCI unbind.
+  compgen -G '/dev/nvidia*' >/dev/null 2>&1 || return 0
+  for attempt in {{1..120}}; do
+    fuser /dev/nvidia* >/dev/null 2>&1 || return 0
+    sleep 0.5
+  done
+  fuser -TERM -k /dev/nvidia* 2>/dev/null || true
+  for attempt in {{1..20}}; do
+    fuser /dev/nvidia* >/dev/null 2>&1 || return 0
+    sleep 0.5
+  done
+  fuser -KILL -k /dev/nvidia* 2>/dev/null || true
+}}
 deactivate_graphical_outputs() {{
   local session uid user auth output
   session="$(loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null || true)"
@@ -555,6 +586,7 @@ case "${{2:-}}:${{3:-}}" in
     if command -v loginctl >/dev/null 2>&1; then
       bounded 15s loginctl terminate-seat seat0 || true
     fi
+    drain_gpu_clients
     for vt in /sys/class/vtconsole/vtcon*/bind; do [[ -w "$vt" ]] && echo 0 > "$vt" || true; done
     if [[ -w /sys/bus/platform/drivers/efi-framebuffer/unbind && -e /sys/bus/platform/devices/efi-framebuffer.0 ]]; then
       printf '%s' efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind 2>/dev/null || true

@@ -153,6 +153,10 @@ libvirt hook 內回呼 `virsh`。精靈還會在關閉畫面前驗證 GPU 的 IO
 失敗會觸發 EXIT trap，清除 `driver_override`、重新 probe 原驅動並啟動畫面，
 避免 hook 無限卡住而留下長時間黑屏。
 
+關閉 seat 後，hook 會先等待 NVIDIA client 釋放 `/dev/nvidia*`，再以有界的 TERM/KILL
+清理仍占用裝置節點的程序，最後才進行 PCI unbind。離線包固定包含 `psmisc`（提供
+`fuser`）；若使用自行裁切的極簡系統，請先確認 `fuser` 可用。
+
 單 GPU 的顯示 function 預設生成 `<rom bar="off"/>`，等同取消 virt-manager 裡的
 「ROM BAR」勾選；libvirt 會將它轉成 QEMU `rombar=0`。部分高階 NVIDIA 顯卡若保留
 預設 ROM BAR，QEMU/guest 韌體可能無法正確讀取或映射顯卡 ROM，結果是螢幕有訊號但

@@ -110,6 +110,10 @@ sudo ./deploy.sh recover-display --vm win11
 /var/log/libvirt/qemu/win11-gpu-hook.log
 ```
 
+關閉 seat 後，hook 會先等待 NVIDIA client 釋放 `/dev/nvidia*`，再以有界的 TERM/KILL
+清理仍占用裝置節點的程序，最後才進行 PCI unbind。離線包固定包含 `psmisc`（提供
+`fuser`）；若使用自行裁切的極簡系統，請先確認 `fuser` 可用。
+
 顯示 function 預設關閉 ROM BAR（`rombar=0`），可在直通精靈中明確開啟。USB 周邊採 VID/PID，
 重複裝置才追加 Bus/Device；整組 USB controller 不會自動直通。
 

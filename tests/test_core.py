@@ -923,6 +923,7 @@ class OfflineTests(unittest.TestCase):
             Path(__file__).parents[1] / "tools" / "prepare_offline_rootless.sh"
         ).read_text(encoding="utf-8")
         self.assertIn("swtpm swtpm-tools libtpms0", script)
+        self.assertIn("pciutils psmisc usbutils", script)
         self.assertIn('prune_superseded_debs.py" "$DEB_DIR"', script)
 
     def test_offline_bundle_retains_canonical_linux_722_tarball(self):
@@ -1477,6 +1478,9 @@ class HookTests(unittest.TestCase):
             self.assertIn("driver_override", script_text)
             self.assertIn("echo vfio-pci", script_text)
             self.assertIn("loginctl terminate-seat seat0", script_text)
+            self.assertIn("drain_gpu_clients", script_text)
+            self.assertIn("fuser -TERM -k /dev/nvidia*", script_text)
+            self.assertIn("fuser -KILL -k /dev/nvidia*", script_text)
             self.assertIn("for attempt in {1..8}", script_text)
             self.assertIn('[[ -d "/sys/module/$module" ]] || continue', script_text)
             self.assertIn(
@@ -1544,6 +1548,10 @@ class HookTests(unittest.TestCase):
                 ),
                 unbind_offset,
             )
+            self.assertLess(
+                script_text.index("    drain_gpu_clients", prepare_offset),
+                unbind_offset,
+            )
             self.assertIn('xrandr --output "$output" --off', script_text)
             self.assertIn('xrandr --output "$output" --preferred', script_text)
             self.assertNotIn("xrandr --auto", script_text)
@@ -1589,6 +1597,23 @@ class HookTests(unittest.TestCase):
                 call.args[0][:2] == ["bash", "-lc"]
                 for call in runner.run.call_args_list
             ))
+
+    def test_recover_single_gpu_skips_restart_when_host_is_healthy(self):
+        device = PciDevice(
+            "01:00.0", "0300", "10de", "1234", "Test GPU", driver="nvidia"
+        )
+        runner = Mock()
+        runner.run.return_value = subprocess.CompletedProcess([], 0)
+        with patch.object(hooks, "require_root"), \
+                patch.object(hooks, "_qemu_running", return_value=False), \
+                patch.object(hooks, "_bound_driver", return_value="nvidia"), \
+                patch.object(hooks, "_restore_device") as restore:
+            hooks.recover_single_gpu("test", [device], runner)
+        restore.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in runner.run.call_args_list],
+            [["systemctl", "is-active", "--quiet", "display-manager.service"]],
+        )
 
 
     def test_recover_refuses_hot_rebind_for_stale_nvidia(self):

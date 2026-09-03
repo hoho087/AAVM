@@ -20,6 +20,7 @@ bridge-utils
 cpu-checker
 dnsmasq-base
 pciutils
+psmisc
 usbutils
 dmidecode
 acpica-tools

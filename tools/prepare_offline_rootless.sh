@@ -33,7 +33,7 @@ packages=(
   gir1.2-spiceclientglib-2.0 gir1.2-spiceclientgtk-3.0
   libxml2-utils ovmf
   swtpm swtpm-tools libtpms0 bridge-utils cpu-checker dnsmasq-base
-  pciutils usbutils dmidecode acpica-tools python3-virt-firmware
+  pciutils psmisc usbutils dmidecode acpica-tools python3-virt-firmware
   git ca-certificates curl wget dkms mokutil shim-signed openssl
   linux-headers-generic
   build-essential gcc g++ make nasm uuid-dev python3 python3-venv python3-pip
