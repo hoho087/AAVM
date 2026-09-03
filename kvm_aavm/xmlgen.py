@@ -583,11 +583,17 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
     ovmf_code = paths.get("install_ovmf_code", INSTALL_OVMF_CODE) if install_stage else paths["ovmf_code"]
     ovmf_code_format = "qcow2" if install_stage and paths.get("install_ovmf_code") else ("raw" if install_stage else "qcow2")
     ovmf_vars = paths.get("install_ovmf_vars", paths["ovmf_vars"])
+    # Custom OVMF CODE files are not listed in the host firmware manifest.
+    # An explicit VARS template prevents libvirt from trying (and failing) to
+    # infer a master store from the loader filename at start time.  Keep the
+    # generated VARS image separate from the persistent per-VM NVRAM target so
+    # --reset-nvram remains safe.
+    ovmf_vars_template = paths["ovmf_vars"]
 
     os_element = _sub(domain, "os")
     _sub(os_element, "type", "hvm", arch="x86_64", machine=machine_type)
     _sub(os_element, "loader", ovmf_code, readonly="yes", secure="yes", type="pflash", format=ovmf_code_format)
-    _sub(os_element, "nvram", ovmf_vars, format="qcow2")
+    _sub(os_element, "nvram", ovmf_vars, format="qcow2", template=ovmf_vars_template)
     _sub(os_element, "bootmenu", enable="yes")
     if install_stage:
         _sub(os_element, "boot", dev="cdrom")
@@ -734,6 +740,10 @@ def build_domain_xml(profile: dict, install_stage: bool = True, *, stage: str | 
     gpu_display_pci = set(_gpu_display_functions(gpu_pci, host_pci))
     for index, address in enumerate(active_pci):
         hostdev = _sub(devices, "hostdev", mode="subsystem", type="pci", managed="yes")
+        # libvirt 10/QEMU 11 reject the omitted PCI backend as "default".
+        # Select the only supported backend explicitly so existing and new
+        # deployments behave consistently across libvirt versions.
+        _sub(hostdev, "driver", name="vfio")
         source = _sub(hostdev, "source")
         _sub(source, "address", **_pci_address(address))
         alias = address.replace(":", "-").replace(".", "-")
@@ -866,6 +876,21 @@ def _usb_source_matches(source: ET.Element | None, configured: list[dict]) -> bo
     )
 
 
+def _ensure_pci_hostdev_vfio(root: ET.Element) -> None:
+    """Repair legacy PCI hostdevs that omitted libvirt's VFIO backend."""
+    devices = root.find("devices")
+    if devices is None:
+        return
+    for hostdev in devices.findall("hostdev"):
+        if hostdev.get("type") != "pci":
+            continue
+        driver = hostdev.find("driver")
+        if driver is None:
+            driver = ET.Element("driver")
+            hostdev.insert(0, driver)
+        driver.set("name", "vfio")
+
+
 def update_passthrough(xml_text: str, old: dict, new: dict, identity: dict) -> str:
     root = ET.fromstring(xml_text)
     devices = root.find("devices")
@@ -891,6 +916,7 @@ def update_passthrough(xml_text: str, old: dict, new: dict, identity: dict) -> s
     )
     for index, address in enumerate(new.get("pci", [])):
         hostdev = _sub(devices, "hostdev", mode="subsystem", type="pci", managed="yes")
+        _sub(hostdev, "driver", name="vfio")
         source = _sub(hostdev, "source")
         _sub(source, "address", **_pci_address(address))
         alias = address.replace(":", "-").replace(".", "-")
@@ -952,6 +978,7 @@ def update_passthrough(xml_text: str, old: dict, new: dict, identity: dict) -> s
 
 def update_identity(xml_text: str, identity: dict, _memory_gib: int) -> str:
     root = ET.fromstring(xml_text)
+    _ensure_pci_hostdev_vfio(root)
     type_element = root.find("./os/type")
     emulator = root.findtext("./devices/emulator", default="")
     install_stage = (
@@ -1003,6 +1030,7 @@ def update_identity(xml_text: str, identity: dict, _memory_gib: int) -> str:
 
 def update_artifact_paths(xml_text: str, paths: dict) -> str:
     root = ET.fromstring(xml_text)
+    _ensure_pci_hostdev_vfio(root)
     type_element = root.find("./os/type")
     install_stage = (
         type_element is not None
@@ -1017,6 +1045,11 @@ def update_artifact_paths(xml_text: str, paths: dict) -> str:
     nvram = root.find("./os/nvram")
     if nvram is not None:
         nvram.text = paths.get("install_ovmf_vars", paths["ovmf_vars"])
+        # Keep the template paired with the active patched OVMF generation.
+        # Without it libvirt cannot start a custom loader that is absent from
+        # /usr/share/qemu/firmware/*.json.
+        if paths.get("ovmf_vars"):
+            nvram.set("template", paths["ovmf_vars"])
     commandline = root.find(f"{{{QEMU_NS}}}commandline")
     if commandline is not None:
         aml_paths = iter(paths.get("ssdt", []))
@@ -1072,7 +1105,16 @@ def validate_required(xml_text: str) -> list[str]:
     elif tpm_mode == "none" and tpm is not None:
         errors.append("TPM XML exists while profile declares no TPM")
     if patched_stage:
+        nvram = root.find("./os/nvram")
+        checks["OVMF VARS template"] = (
+            nvram if nvram is not None and nvram.get("template") else None
+        )
         checks["QEMU split IOAPIC"] = root.find("./features/ioapic[@driver='qemu']")
+        pci_hostdevs = root.findall("./devices/hostdev[@type='pci']")
+        for index, hostdev in enumerate(pci_hostdevs, 1):
+            checks[f"PCI hostdev {index} VFIO backend"] = hostdev.find(
+                "driver[@name='vfio']"
+            )
         if stage == "gpu-setup":
             checks["GPU maintenance VNC"] = root.find("./devices/graphics[@type='vnc']")
             checks["GPU maintenance VGA"] = root.find("./devices/video")

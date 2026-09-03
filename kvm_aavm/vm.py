@@ -24,7 +24,7 @@ from .xmlgen import (
     amd_avic_available, amd_nested_hyperv_acceleration_available,
     apply_hyperv_enlightenments,
     build_domain_xml, update_artifact_paths, update_identity, update_passthrough,
-    validate_required,
+    validate_required, _ensure_pci_hostdev_vfio,
 )
 
 
@@ -764,6 +764,10 @@ def _require_amd_ftpm_libtpms(profile: dict, runner: Runner) -> None:
 def _update_guest_security_xml(xml_text: str, profile: dict) -> str:
     """Change only guest-security nodes; preserve every existing device."""
     root = ET.fromstring(xml_text)
+    # Legacy definitions may contain PCI hostdevs without an explicit VFIO
+    # backend.  Security-only updates must repair those definitions as well,
+    # otherwise libvirt 10/QEMU 11 rejects the unchanged hostdev at start.
+    _ensure_pci_hostdev_vfio(root)
     stage = root.find(f"./metadata/{{{AAVM_NS}}}stage")
     if stage is None:
         raise AppError("Managed VM XML is missing kvm-aavm stage metadata.")

@@ -589,6 +589,22 @@ class XmlTests(unittest.TestCase):
             rotated["identity"]["disk_wwn"].removeprefix("0x"),
         )
 
+    def test_identity_rotation_repairs_legacy_pci_backend(self):
+        value = profile()
+        value["passthrough"] = {
+            "mode": "manual", "pci": ["08:00.0"], "gpu_pci": [], "usb": [],
+        }
+        root = ET.fromstring(build_domain_xml(value, stage="final"))
+        hostdev = root.find("./devices/hostdev[@type='pci']")
+        hostdev.remove(hostdev.find("driver"))
+        changed = ET.fromstring(
+            update_identity(ET.tostring(root, encoding="unicode"), value["identity"], 8)
+        )
+        self.assertEqual(
+            changed.find("./devices/hostdev[@type='pci']/driver").get("name"),
+            "vfio",
+        )
+
     def test_single_gpu_is_delayed_until_finalize(self):
         value = profile()
         value["passthrough"] = {
@@ -790,11 +806,21 @@ class XmlTests(unittest.TestCase):
 
     def test_artifact_rotation_updates_every_path(self):
         xml = build_domain_xml(profile(), stage="final")
+        root = ET.fromstring(xml)
+        self.assertEqual(
+            root.find("./os/nvram").get("template"),
+            "/vm/current/ovmf/vars.qcow2",
+        )
         paths = {
             "qemu": "/new/qemu", "ovmf_code": "/new/code.qcow2",
             "ovmf_vars": "/new/vars.qcow2", "ssdt": ["/new/a.aml", "/new/b.aml"],
         }
         changed = update_artifact_paths(xml, paths)
+        changed_root = ET.fromstring(changed)
+        self.assertEqual(
+            changed_root.find("./os/nvram").get("template"),
+            "/new/vars.qcow2",
+        )
         for value in ("/new/qemu", "/new/code.qcow2", "/new/vars.qcow2", "/new/a.aml", "/new/b.aml"):
             self.assertIn(value, changed)
 
@@ -808,6 +834,7 @@ class XmlTests(unittest.TestCase):
         self.assertEqual(root.findtext("./devices/emulator"), INSTALL_QEMU)
         self.assertEqual(root.findtext("./os/loader"), INSTALL_OVMF_CODE)
         self.assertEqual(root.findtext("./os/nvram"), "/new/vars.qcow2")
+        self.assertEqual(root.find("./os/nvram").get("template"), "/new/vars.qcow2")
         self.assertNotIn("/new/a.aml", changed)
 
     def test_persistent_install_nvram_survives_patched_artifact_rotation(self):
@@ -828,6 +855,16 @@ class XmlTests(unittest.TestCase):
             ET.fromstring(changed).findtext("./os/nvram"),
             "/persistent/vars.qcow2",
         )
+        self.assertEqual(
+            ET.fromstring(changed).find("./os/nvram").get("template"),
+            "/new/generated-vars.qcow2",
+        )
+
+    def test_patched_xml_requires_explicit_ovmf_vars_template(self):
+        root = ET.fromstring(build_domain_xml(profile(), stage="final"))
+        root.find("./os/nvram").attrib.pop("template")
+        errors = validate_required(ET.tostring(root, encoding="unicode"))
+        self.assertIn("Missing required XML: OVMF VARS template", errors)
 
 
 class OfflineTests(unittest.TestCase):
@@ -1355,6 +1392,7 @@ class PassthroughTests(unittest.TestCase):
         root = ET.fromstring(build_domain_xml(value, install_stage=False))
         pci = root.find("./devices/hostdev[@type='pci']")
         usb = root.find("./devices/hostdev[@type='usb']")
+        self.assertEqual(pci.find("driver").get("name"), "vfio")
         self.assertIsNone(pci.find("./source/address").get("type"))
         self.assertEqual(pci.find("alias").get("name"), "ua-kvm-aavm-pci-08-00-0")
         self.assertIsNone(pci.find("rom"))
@@ -1374,6 +1412,7 @@ class PassthroughTests(unittest.TestCase):
         }
         root = ET.fromstring(build_domain_xml(value, stage="final"))
         hostdev = root.find("./devices/hostdev[@type='pci']")
+        self.assertEqual(hostdev.find("driver").get("name"), "vfio")
         self.assertEqual(hostdev.find("./source/address").get("function"), "0x4")
         self.assertEqual(hostdev.find("./address").get("function"), "0x0")
 
@@ -1520,10 +1559,8 @@ class HookTests(unittest.TestCase):
             )
             self.assertLess(unbind_offset, core_unload_offset)
             self.assertIn("GPU device unbind failed", script_text)
-            self.assertIn('echo bus > "$dev/reset_method"', script_text)
-            self.assertIn('echo 1 > "$dev/reset"', script_text)
-            self.assertIn("Requested PCIe bus reset is unavailable", script_text)
-            self.assertIn("aborting VM start and restoring the host", script_text)
+            self.assertNotIn("reset_method", script_text)
+            self.assertNotIn("Requested PCIe bus reset is unavailable", script_text)
             self.assertIn("systemctl daemon-reload", script_text)
             self.assertIn("reactivate_graphical_seat", script_text)
             self.assertIn("deactivate_graphical_outputs", script_text)

@@ -412,30 +412,13 @@ def install_single_gpu_hooks(
         ])
     unbind_devices = "\n".join(unbind_lines)
     bind_devices = "\n".join(bind_lines)
-    bus_reset_lines: list[str] = []
-    if force_bus_reset:
-        for device in devices:
-            if not device.class_code.startswith("03"):
-                continue
-            address = f"0000:{device.address}"
-            bus_reset_lines.extend([
-                f"  dev=/sys/bus/pci/devices/{address}",
-                "  if [[ -w \"$dev/reset_method\" ]] && grep -qw bus \"$dev/reset_method\"; then",
-                "    echo bus > \"$dev/reset_method\" || failed=1",
-                "  else",
-                "    failed=1",
-                "  fi",
-                "  [[ -w \"$dev/reset\" ]] && echo 1 > \"$dev/reset\" || failed=1",
-            ])
-    if bus_reset_lines:
-        bus_reset_lines.extend([
-            "  if (( failed )); then",
-            '    echo "Requested PCIe bus reset is unavailable; restoring the host"',
-            "    exit 1",
-            "  fi",
-            "  sleep 1",
-        ])
-    bus_reset_devices = "\n".join(bus_reset_lines)
+    # VFIO already selects the safest reset method supported by the device.
+    # Older profiles exposed a force_bus_reset option, but writing bus to
+    # reset_method is rejected by many modern NVIDIA drivers and made libvirt
+    # abort before QEMU was created. Keep the keyword for API compatibility,
+    # while deliberately avoiding any reset_method sysfs operation here.
+    del force_bus_reset
+    bus_reset_devices = ""
     body = f"""
 [[ "${{1:-}}" == {quoted} ]] || exit 0
 exec >>/var/log/libvirt/qemu/{name}-gpu-hook.log 2>&1
