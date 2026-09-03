@@ -28,7 +28,7 @@ from kvm_aavm.hardware import (
 )
 from kvm_aavm.host import _managed_kvm_module_config, _replace_grub_args, _set_nested_module_option
 from kvm_aavm.identity import apply_board_identity, generate, mac_address, rerandomize
-from kvm_aavm.util import AppError
+from kvm_aavm.util import AppError, CommandResult
 from kvm_aavm.vm import _ensure_disk, _ensure_install_ovmf_code, _stage_install_media
 from kvm_aavm.vm import new_profile
 from kvm_aavm.xmlgen import (
@@ -3388,6 +3388,23 @@ class CliTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_refresh_legacy_pci_backend_defines_only_when_missing(self):
+        xml = """<domain><name>win11</name><devices><hostdev type='pci'><source><address domain='0x0000' bus='0x01' slot='0x00' function='0x0'/></source></hostdev></devices></domain>"""
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            runner = Mock()
+            runner.run.side_effect = [
+                CommandResult(["virsh"], 0, xml, ""),
+                CommandResult(["virsh"], 0, "", ""),
+            ]
+            with patch.object(host, "STATE_DIR", state):
+                host._refresh_legacy_pci_backend("win11", runner)
+            repaired = (state / "vms" / "win11" / "domain.xml").read_text(encoding="utf-8")
+            self.assertIn("<driver name=\"vfio\"", repaired)
+            self.assertIn("<hostdev type=\"pci\"", repaired)
+            self.assertTrue((state / "backups" / "win11" / "domain-before-vfio.xml").is_file())
+            self.assertFalse((state / "vms" / "win11" / ".domain-vfio.xml").exists())
+
     def test_install_application_refreshes_existing_single_gpu_hook(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

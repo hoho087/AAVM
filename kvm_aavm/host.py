@@ -6,6 +6,7 @@ import re
 import shlex
 import shutil
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from .hardware import PciDevice, cpu_info
@@ -204,6 +205,37 @@ done
     runner.run(["systemctl", "try-restart", "libvirtd.service"])
 
 
+def _refresh_legacy_pci_backend(name: str, runner: Runner) -> None:
+    """Add an explicit VFIO backend to an existing managed domain XML."""
+    from .xmlgen import _ensure_pci_hostdev_vfio
+
+    result = runner.run(
+        ["virsh", "dumpxml", "--inactive", name], check=False, capture=True,
+    )
+    if result.returncode or not result.stdout.strip():
+        return
+    try:
+        root = ET.fromstring(result.stdout)
+    except ET.ParseError as exc:
+        raise AppError(f"Cannot parse existing XML for {name}: {exc}") from exc
+    before = ET.tostring(root, encoding="unicode")
+    _ensure_pci_hostdev_vfio(root)
+    updated = ET.tostring(root, encoding="unicode", xml_declaration=True) + "\n"
+    if ET.tostring(root, encoding="unicode") == before:
+        return
+
+    backup = STATE_DIR / "backups" / name / "domain-before-vfio.xml"
+    atomic_write(backup, result.stdout)
+    target = STATE_DIR / "vms" / name / ".domain-vfio.xml"
+    atomic_write(target, updated)
+    try:
+        runner.run(["virsh", "define", "--validate", str(target)])
+    finally:
+        target.unlink(missing_ok=True)
+    atomic_write(STATE_DIR / "vms" / name / "domain.xml", updated)
+    print(f"{name}: repaired legacy PCI hostdev backend to vfio")
+
+
 def configure_virt_manager(runner: Runner) -> None:
     """Let virt-manager compare a custom QEMU machine before host capabilities.
 
@@ -358,6 +390,7 @@ def install_application(runner: Runner) -> None:
         try:
             name = profile.parent.name
             install_performance_hook(name)
+            _refresh_legacy_pci_backend(name, runner)
             # Re-render per-VM GPU hooks as part of an application update.
             # Hook files live under /etc and otherwise remain on the old
             # generator version after upgrading the deployer package.
