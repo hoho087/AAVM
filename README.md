@@ -20,7 +20,7 @@ Windows 啟用、驅動重新安裝、BitLocker 或 Windows Hello 復原
   6.19 穩定核心，缺少相符 CPU 補丁時會拒絕建置。
 
 詳細的風險、XML 欄位、故障排查和設計理由請閱讀
-[`DEPLOYMENT.zh-TW.md`](DEPLOYMENT.zh-TW.md)。
+[`DEPLOYMENT.zh-TW.md`](DEPLOYMENT.zh-TW.md) (裡面很多是開發過程中的紀錄 但我懶得做成changelog)。
 
 ## 建立離線包
 
