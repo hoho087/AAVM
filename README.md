@@ -7,17 +7,16 @@ Ubuntu 24.04 amd64 的離線 KVM/QEMU Windows 部署器。專案會在每台 VM 
 可回復的去虛擬化、身分管理、TPM、Secure Boot、VBS/HVCI 與硬體直通流程。
 
 AMD 9850x3d在[VMAware](https://github.com/NotRequiem/VMAware)測試2.8.1 100%pass。大量變更硬體身分可能觸發
-Windows 啟用、驅動重新安裝、BitLocker 或 Windows Hello 復原；請只在自己擁有且獲授權的主機、
-作業系統與映像上使用。
+Windows 啟用、驅動重新安裝、BitLocker 或 Windows Hello 復原
 
 ## 使用前提
 
 - 主機：Ubuntu 24.04 amd64，已在 BIOS 開啟 AMD-V/AMD-Vi（或 Intel VT-x/VT-d）。
-- 必須能使用 root 權限；離線安裝主機不會由部署器偷偷連網。
+- 必須能使用 root 權限。
 - 建立 VM 時提供合法取得的 Windows ISO 絕對路徑。ISO 不會被移動或刪除。
 - 單 GPU 直通會暫停主機顯示輸出，建議先準備 SSH 或 TTY；不要直通主機目前依賴的儲存、
   網路或 USB 控制器。
-- 目前實驗核心固定為 Linux `7.2.2`，不是 `7.2-rc7`。它不會取代 Ubuntu 官方核心或
+- 目前實驗核心固定為 Linux `7.2.2`。它不會取代 Ubuntu 官方核心或
   6.19 穩定核心，缺少相符 CPU 補丁時會拒絕建置。
 
 詳細的風險、XML 欄位、故障排查和設計理由請閱讀
