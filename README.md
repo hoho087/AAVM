@@ -1,5 +1,7 @@
 # KVM-AntiAntiVM
 
+基於[Nika](https://github.com/Ape-xCV/Nika-Read-Only)的自動化部署修改版，可以在VM開啟VTD、安全啟動、tpm等，且都patch過
+
 Ubuntu 24.04 amd64 的離線 KVM/QEMU Windows 部署器。專案會在每台 VM 的獨立產物目錄建置
 自訂 QEMU、OVMF、SSDT 與可選 Linux 核心，並以 libvirt 管理 Windows VM。目標是提供可重現、
 可回復的去虛擬化、身分管理、TPM、Secure Boot、VBS/HVCI 與硬體直通流程。
