@@ -4,7 +4,7 @@ Ubuntu 24.04 amd64 的離線 KVM/QEMU Windows 部署器。專案會在每台 VM 
 自訂 QEMU、OVMF、SSDT 與可選 Linux 核心，並以 libvirt 管理 Windows VM。目標是提供可重現、
 可回復的去虛擬化、身分管理、TPM、Secure Boot、VBS/HVCI 與硬體直通流程。
 
-本專案不是匿名化或安全產品，也不保證任何第三方反虛擬機檢測結果。大量變更硬體身分可能觸發
+AMD 9850x3d在[VMAware](https://github.com/NotRequiem/VMAware)測試2.8.1 100%pass。大量變更硬體身分可能觸發
 Windows 啟用、驅動重新安裝、BitLocker 或 Windows Hello 復原；請只在自己擁有且獲授權的主機、
 作業系統與映像上使用。
 
